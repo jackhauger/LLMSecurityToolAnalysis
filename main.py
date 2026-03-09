@@ -7,8 +7,10 @@ Commands:
   simulate — Run adversarial attack simulations with judge evaluation
 """
 
+import json
 import sys
 import uuid
+from datetime import datetime, timezone
 
 import click
 from rich.console import Console
@@ -16,6 +18,15 @@ from rich.table import Table
 from rich import box
 
 console = Console()
+
+
+def _check_phoenix() -> bool:
+    try:
+        import requests
+        r = requests.get("http://localhost:6006", timeout=2)
+        return r.status_code < 500
+    except Exception:
+        return False
 
 
 def _startup() -> tuple:
@@ -152,6 +163,36 @@ def query(query_text: str, attack_type: str):
 # ---------------------------------------------------------------------------
 
 
+def _write_attack_log(result, log_path: str) -> None:
+    """Append one JSON line per attack result to the log file."""
+    context_docs_summary = [
+        {
+            "page_content": doc.page_content[:500],
+            "metadata": doc.metadata,
+        }
+        for doc in result.final_state.get("context_docs", [])
+    ]
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "attack_name": result.attack_name,
+        "run_id": result.run_id,
+        "query_used": result.query_used,
+        "attack_detectable": result.attack_detectable,
+        "judge_verdict": result.judge_verdict,
+        "traces": result.traces,
+        "final_state": {
+            "query": result.final_state.get("query", ""),
+            "llm_response": result.final_state.get("llm_response", ""),
+            "metadata": result.final_state.get("metadata", {}),
+            "context_docs": context_docs_summary,
+        },
+        "error": result.error,
+        "poisoned_doc_id": result.poisoned_doc_id,
+    }
+    with open(log_path, "a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
 @cli.command()
 @click.option(
     "--attack",
@@ -161,11 +202,18 @@ def query(query_text: str, attack_type: str):
 def simulate(attack: str):
     """Run adversarial attack simulations with judge-LLM evaluation from real traces."""
     from simulate_attacks import ATTACK_REGISTRY, AttackResult
+    from config import cfg
 
     obs, graph = None, None
     try:
         print("Starting up (first run may take ~30s for dependency loading)...", flush=True)
         obs, graph = _startup()
+
+        if not _check_phoenix():
+            console.print(
+                "[yellow]Warning:[/yellow] Phoenix not reachable at localhost:6006. "
+                "Start it with: phoenix serve\nPhoenix spans will be missing from judge traces."
+            )
 
         if attack == "all":
             attack_names = list(ATTACK_REGISTRY.keys())
@@ -186,6 +234,7 @@ def simulate(attack: str):
             attack_fn = ATTACK_REGISTRY[name]
             result = attack_fn(graph, obs)
             results.append(result)
+            _write_attack_log(result, cfg.log_file)
 
             if result.error:
                 console.print(f"  [red]ERROR:[/red] {result.error[:200]}")
@@ -227,6 +276,7 @@ def simulate(attack: str):
         console.print(
             f"\n[bold]Summary:[/bold] {detectable_count}/{len(results)} attacks detectable from traces"
         )
+        console.print(f"[dim]Log:[/dim] {cfg.log_file}")
 
     finally:
         if obs:

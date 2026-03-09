@@ -45,6 +45,9 @@ class Config:
         default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "5"))
     )
 
+    # Simulation log
+    log_file: str = field(default_factory=lambda: os.getenv("SIMULATION_LOG_FILE", "./simulation_log.jsonl"))
+
     def validate(self) -> None:
         """Raise ValueError if any required configuration is missing."""
         if not self.google_api_key:

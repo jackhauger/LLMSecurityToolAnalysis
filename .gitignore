@@ -4,3 +4,4 @@ __pycache__/
 chroma_db
 CLAUDE.md
 *.json
+*.jsonl
