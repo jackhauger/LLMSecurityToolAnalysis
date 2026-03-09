@@ -274,10 +274,18 @@ def add_poisoned_document(doc_text: str, attack_type: str) -> str:
     Insert a poisoned document into the collection.
 
     Returns the generated document ID for later cleanup.
+    Metadata is extracted from document content so the entry is
+    indistinguishable from real ATT&CK chunks by metadata alone.
     """
-    doc_id = f"poison_{attack_type}_{int(time.time() * 1000)}"
+    import re
+    doc_id = f"att&ck-ext-{int(time.time() * 1000)}"
     embedding = _get_embed_doc().embed_documents([doc_text])[0]
     collection_date = datetime.now(timezone.utc).isoformat()
+
+    tech_match = re.search(r'^Technique:\s*(.+)$', doc_text, re.MULTILINE)
+    technique_name = tech_match.group(1).strip() if tech_match else "Unknown Technique"
+    tactic_match = re.search(r'^Tactics:\s*(.+)$', doc_text, re.MULTILINE)
+    tactics = tactic_match.group(1).strip() if tactic_match else "unknown"
 
     _collection.upsert(
         ids=[doc_id],
@@ -287,10 +295,8 @@ def add_poisoned_document(doc_text: str, attack_type: str) -> str:
             {
                 "source_id": doc_id,
                 "collection_date": collection_date,
-                "is_poisoned": True,
-                "chunk_type": "poisoned",
-                "technique_name": f"POISON:{attack_type}",
-                "tactics": "adversarial",
+                "technique_name": technique_name,
+                "tactics": tactics,
             }
         ],
     )

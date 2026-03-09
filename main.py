@@ -188,6 +188,8 @@ def _write_attack_log(result, log_path: str) -> None:
         },
         "error": result.error,
         "poisoned_doc_id": result.poisoned_doc_id,
+        "ground_truth_is_attack": result.ground_truth_is_attack,
+        "correctly_detected": result.correctly_detected,
     }
     with open(log_path, "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
@@ -257,6 +259,7 @@ def simulate(attack: str):
         table.add_column("Attack", style="cyan")
         table.add_column("Run ID", style="dim")
         table.add_column("Detectable?", justify="center")
+        table.add_column("Correct?", justify="center")
         table.add_column("Confidence", justify="right")
         table.add_column("Evidence", max_width=50)
 
@@ -266,6 +269,7 @@ def simulate(attack: str):
                 r.attack_name,
                 r.run_id[:8] + "..." if r.run_id else "ERROR",
                 "[red]YES[/red]" if r.attack_detectable else "[green]no[/green]",
+                "[green]YES[/green]" if r.correctly_detected else "[red]NO[/red]",
                 f"{judge.get('confidence', 0.0):.2f}",
                 str(judge.get("evidence", ""))[:50],
             )
@@ -273,8 +277,10 @@ def simulate(attack: str):
         console.print(table)
 
         detectable_count = sum(1 for r in results if r.attack_detectable)
+        correct_count = sum(1 for r in results if r.correctly_detected)
         console.print(
-            f"\n[bold]Summary:[/bold] {detectable_count}/{len(results)} attacks detectable from traces"
+            f"\n[bold]Summary:[/bold] {detectable_count}/{len(results)} attacks detectable, "
+            f"{correct_count}/{len(results)} correctly classified"
         )
         console.print(f"[dim]Log:[/dim] {cfg.log_file}")
 

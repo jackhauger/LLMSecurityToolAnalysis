@@ -8,6 +8,7 @@ Each node is a factory function returning a closure so it can close over shared
 resources (LLM, obs callbacks, etc.) without relying on global state.
 """
 
+import re
 from typing import Dict, List
 
 from langchain_core.documents import Document
@@ -55,9 +56,9 @@ def _make_rewrite_query_node(llm: ChatGoogleGenerativeAI):
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             usage = response.usage_metadata
             token_usage = {
-                "prompt_tokens": getattr(usage, "input_tokens", 0),
-                "completion_tokens": getattr(usage, "output_tokens", 0),
-                "total_tokens": getattr(usage, "total_tokens", 0),
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
             }
 
         return {
@@ -82,20 +83,28 @@ def _make_retrieve_node():
     return retrieve
 
 
+_INJECTION_PATTERN = re.compile(
+    r'\[(?:SYSTEM|IMPORTANT|NOTE).*?\]|ignore previous instructions|instructions are suspended',
+    re.IGNORECASE,
+)
+
+
 def _make_analyze_context_node():
-    """Compute metadata about retrieved context (poisoning, relevance, diversity)."""
+    """Compute metadata about retrieved context (injection patterns, relevance, diversity)."""
 
     def analyze_context(state: AgentState) -> dict:
         docs = state.get("context_docs", [])
         if not docs:
             analysis = {
-                "poisoned_doc_count": 0,
+                "injection_pattern_count": 0,
                 "avg_relevance_score": 0.0,
                 "source_diversity_ratio": 0.0,
             }
             return {"metadata": {**state.get("metadata", {}), "context_analysis": analysis}}
 
-        poisoned_count = sum(1 for d in docs if d.metadata.get("is_poisoned", False))
+        injection_count = sum(
+            1 for d in docs if _INJECTION_PATTERN.search(d.page_content or "")
+        )
         scores = [d.metadata.get("relevance_score", 0.0) for d in docs]
         avg_score = sum(scores) / len(scores) if scores else 0.0
 
@@ -104,7 +113,7 @@ def _make_analyze_context_node():
         diversity_ratio = len(source_ids) / len(docs) if docs else 0.0
 
         analysis = {
-            "poisoned_doc_count": poisoned_count,
+            "injection_pattern_count": injection_count,
             "avg_relevance_score": round(avg_score, 4),
             "source_diversity_ratio": round(diversity_ratio, 4),
         }
@@ -146,9 +155,9 @@ def _make_generate_node(llm: ChatGoogleGenerativeAI):
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             usage = response.usage_metadata
             token_usage = {
-                "prompt_tokens": getattr(usage, "input_tokens", 0),
-                "completion_tokens": getattr(usage, "output_tokens", 0),
-                "total_tokens": getattr(usage, "total_tokens", 0),
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
             }
 
         return {

@@ -131,6 +131,51 @@ class ObservabilityManager:
             callbacks.append(self._langfuse_handler)
         return callbacks
 
+    def start_run(self, run_id: str) -> None:
+        """Create a per-run Langfuse CallbackHandler so all nodes group under one trace."""
+        self._current_run_id = run_id
+        self._run_langfuse_handler = None
+        if not self._langfuse_available or self._langfuse_handler is None:
+            return
+        try:
+            from langfuse.types import TraceContext
+            HandlerClass = type(self._langfuse_handler)
+            self._run_langfuse_handler = HandlerClass(
+                trace_context=TraceContext(trace_id=run_id.replace("-", "")),
+            )
+        except Exception:
+            pass
+
+    def get_run_callbacks(self) -> List[Any]:
+        """Return per-run callbacks for graph.invoke(config={'callbacks': ...})."""
+        handler = getattr(self, "_run_langfuse_handler", None)
+        return [handler] if handler else []
+
+    def _record_langfuse_generation(self, node_name: str, token_usage: dict) -> None:
+        """Attach a generation with token counts to the current run trace via low-level SDK."""
+        if not token_usage or not self._langfuse_available:
+            return
+        run_id = getattr(self, "_current_run_id", None)
+        if not run_id:
+            return
+        try:
+            from langfuse.types import TraceContext
+            lf_client = getattr(self._langfuse_handler, "client", None)
+            if lf_client is None:
+                return
+            gen = lf_client.start_generation(
+                trace_context=TraceContext(trace_id=run_id.replace("-", "")),
+                name=node_name,
+                usage_details={
+                    "input": token_usage.get("prompt_tokens", 0),
+                    "output": token_usage.get("completion_tokens", 0),
+                    "total": token_usage.get("total_tokens", 0),
+                },
+            )
+            gen.end()
+        except Exception:
+            pass
+
     def wrap_node(self, node_name: str, fn: Callable) -> Callable:
         """
         Wrap a LangGraph node function with an OTEL span.
@@ -159,9 +204,22 @@ class ObservabilityManager:
                         # Consume token usage — never reaches AgentState
                         token_usage = result.pop("_token_usage", {})
                         if token_usage:
-                            span.set_attribute("llm.usage.prompt_tokens", token_usage.get("prompt_tokens", 0))
-                            span.set_attribute("llm.usage.completion_tokens", token_usage.get("completion_tokens", 0))
-                            span.set_attribute("llm.usage.total_tokens", token_usage.get("total_tokens", 0))
+                            span.set_attribute("llm.token_count.prompt", token_usage.get("prompt_tokens", 0))
+                            span.set_attribute("llm.token_count.completion", token_usage.get("completion_tokens", 0))
+                            span.set_attribute("llm.token_count.total", token_usage.get("total_tokens", 0))
+                            obs._record_langfuse_generation(node_name, token_usage)
+
+                        # Output summary for forensic trace analysis
+                        output_summary = {}
+                        if "llm_response" in result:
+                            output_summary["llm_response"] = str(result["llm_response"])[:500]
+                        if "query" in result:
+                            output_summary["query"] = str(result["query"])[:200]
+                        if "context_docs" in result:
+                            docs = result["context_docs"]
+                            output_summary["context_doc_count"] = len(docs)
+                        if output_summary:
+                            span.set_attribute("node.output_summary", json.dumps(output_summary, default=str))
 
                         # Retrieval-specific events
                         if node_name == "Retrieve":
@@ -177,18 +235,6 @@ class ObservabilityManager:
                                 "retrieval.context_docs",
                                 attributes={"docs": json.dumps(docs_payload, default=str)},
                             )
-                            poisoned = [d for d in context_docs if d.metadata.get("is_poisoned")]
-                            if poisoned:
-                                span.add_event(
-                                    "retrieval.poisoned_docs_detected",
-                                    attributes={
-                                        "count": len(poisoned),
-                                        "ids": json.dumps(
-                                            [d.metadata.get("source_id", "") for d in poisoned],
-                                            default=str,
-                                        ),
-                                    },
-                                )
 
                         print(f"[Pipeline] {node_name} done ({latency_ms:.0f}ms)", flush=True)
                         return result
@@ -202,7 +248,9 @@ class ObservabilityManager:
             else:
                 # No OTEL — still pop _token_usage so it never reaches AgentState
                 result = fn(state)
-                result.pop("_token_usage", None)
+                token_usage = result.pop("_token_usage", {})
+                if token_usage:
+                    obs._record_langfuse_generation(node_name, token_usage)
                 latency_ms = (time.time() - start_time) * 1000
                 print(f"[Pipeline] {node_name} done ({latency_ms:.0f}ms)", flush=True)
                 return result
