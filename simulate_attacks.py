@@ -34,17 +34,20 @@ class AttackResult:
     query_used: str
     final_state: Dict[str, Any]
     run_id: str
-    judge_verdict: Dict[str, Any]
-    attack_detectable: bool
+    judge_verdicts: Dict[str, Any]          # {"langsmith": {...}, "phoenix": {...}, "langfuse": {...}}
     error: Optional[str] = None
     poisoned_doc_id: Optional[str] = None
     traces: Dict[str, Any] = None
     ground_truth_is_attack: bool = True
+    attack_detectable: bool = field(init=False)
     correctly_detected: bool = field(init=False)
 
     def __post_init__(self):
         if self.traces is None:
             self.traces = {}
+        self.attack_detectable = any(
+            v.get("attack_detectable", False) for v in self.judge_verdicts.values()
+        )
         self.correctly_detected = (self.attack_detectable == self.ground_truth_is_attack)
 
 
@@ -359,15 +362,16 @@ def _run_indirect_prompt_injection(graph, obs) -> AttackResult:
             "phoenix": _fetch_phoenix_spans(start_time),
             "langfuse": _fetch_langfuse_traces(start_time),
         }
-        verdict = judge_from_traces(attack_name, query, traces)
+        judge_verdicts = {}
+        for backend in ("langsmith", "phoenix", "langfuse"):
+            judge_verdicts[backend] = judge_from_traces(attack_name, query, {backend: traces[backend]})
 
         return AttackResult(
             attack_name=attack_name,
             query_used=query,
             final_state=final_state,
             run_id=run_id,
-            judge_verdict=verdict,
-            attack_detectable=verdict.get("attack_detectable", False),
+            judge_verdicts=judge_verdicts,
             poisoned_doc_id=doc_id,
             traces=traces,
         )
@@ -377,8 +381,7 @@ def _run_indirect_prompt_injection(graph, obs) -> AttackResult:
             query_used=query,
             final_state={},
             run_id="",
-            judge_verdict={"attack_detectable": False, "evidence": "", "confidence": 0.0, "reasoning": str(e)},
-            attack_detectable=False,
+            judge_verdicts={},
             error=traceback.format_exc(),
             poisoned_doc_id=doc_id,
         )
@@ -432,15 +435,16 @@ def _run_pii_exfiltration(graph, obs) -> AttackResult:
             "phoenix": _fetch_phoenix_spans(start_time),
             "langfuse": _fetch_langfuse_traces(start_time),
         }
-        verdict = judge_from_traces(attack_name, query, traces)
+        judge_verdicts = {}
+        for backend in ("langsmith", "phoenix", "langfuse"):
+            judge_verdicts[backend] = judge_from_traces(attack_name, query, {backend: traces[backend]})
 
         return AttackResult(
             attack_name=attack_name,
             query_used=query,
             final_state=final_state,
             run_id=run_id,
-            judge_verdict=verdict,
-            attack_detectable=verdict.get("attack_detectable", False),
+            judge_verdicts=judge_verdicts,
             poisoned_doc_id=doc_id,
             traces=traces,
         )
@@ -450,8 +454,7 @@ def _run_pii_exfiltration(graph, obs) -> AttackResult:
             query_used=query,
             final_state={},
             run_id="",
-            judge_verdict={"attack_detectable": False, "evidence": "", "confidence": 0.0, "reasoning": str(e)},
-            attack_detectable=False,
+            judge_verdicts={},
             error=traceback.format_exc(),
             poisoned_doc_id=doc_id,
         )
@@ -500,15 +503,16 @@ def _run_dos_token_exhaustion(graph, obs) -> AttackResult:
             "phoenix": _fetch_phoenix_spans(start_time),
             "langfuse": _fetch_langfuse_traces(start_time),
         }
-        verdict = judge_from_traces(attack_name, query[:500], traces)
+        judge_verdicts = {}
+        for backend in ("langsmith", "phoenix", "langfuse"):
+            judge_verdicts[backend] = judge_from_traces(attack_name, query[:500], {backend: traces[backend]})
 
         return AttackResult(
             attack_name=attack_name,
             query_used=query,
             final_state=final_state,
             run_id=run_id,
-            judge_verdict=verdict,
-            attack_detectable=verdict.get("attack_detectable", False),
+            judge_verdicts=judge_verdicts,
             traces=traces,
         )
     except Exception as e:
@@ -517,8 +521,7 @@ def _run_dos_token_exhaustion(graph, obs) -> AttackResult:
             query_used=query,
             final_state={},
             run_id="",
-            judge_verdict={"attack_detectable": False, "evidence": "", "confidence": 0.0, "reasoning": str(e)},
-            attack_detectable=False,
+            judge_verdicts={},
             error=traceback.format_exc(),
         )
 

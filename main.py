@@ -121,7 +121,7 @@ def query(query_text: str, attack_type: str):
         if context_analysis:
             console.print(
                 f"[bold]Context Analysis:[/bold] "
-                f"poisoned={context_analysis.get('poisoned_doc_count', 0)}, "
+                f"injection_patterns={context_analysis.get('injection_pattern_count', 0)}, "
                 f"avg_relevance={context_analysis.get('avg_relevance_score', 0.0):.4f}, "
                 f"diversity={context_analysis.get('source_diversity_ratio', 0.0):.4f}"
             )
@@ -163,33 +163,32 @@ def query(query_text: str, attack_type: str):
 # ---------------------------------------------------------------------------
 
 
-def _write_attack_log(result, log_path: str) -> None:
-    """Append one JSON line per attack result to the log file."""
+def _write_attack_log(result, backend: str, log_path: str) -> None:
+    """Append one JSON line for a single backend's trace and verdict to the log file."""
     context_docs_summary = [
-        {
-            "page_content": doc.page_content[:500],
-            "metadata": doc.metadata,
-        }
+        {"page_content": doc.page_content[:500], "metadata": doc.metadata}
         for doc in result.final_state.get("context_docs", [])
     ]
+    verdict = result.judge_verdicts.get(backend, {})
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "backend": backend,
         "attack_name": result.attack_name,
         "run_id": result.run_id,
         "query_used": result.query_used,
-        "attack_detectable": result.attack_detectable,
-        "judge_verdict": result.judge_verdict,
-        "traces": result.traces,
+        "trace": result.traces.get(backend, {}),
+        "judge_verdict": verdict,
+        "attack_detectable": verdict.get("attack_detectable", False),
+        "correctly_detected": verdict.get("attack_detectable", False) == result.ground_truth_is_attack,
+        "ground_truth_is_attack": result.ground_truth_is_attack,
+        "error": result.error,
+        "poisoned_doc_id": result.poisoned_doc_id,
         "final_state": {
             "query": result.final_state.get("query", ""),
             "llm_response": result.final_state.get("llm_response", ""),
             "metadata": result.final_state.get("metadata", {}),
             "context_docs": context_docs_summary,
         },
-        "error": result.error,
-        "poisoned_doc_id": result.poisoned_doc_id,
-        "ground_truth_is_attack": result.ground_truth_is_attack,
-        "correctly_detected": result.correctly_detected,
     }
     with open(log_path, "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
@@ -231,58 +230,78 @@ def simulate(attack: str):
         console.rule("[bold red]Attack Simulation")
         results: list[AttackResult] = []
 
+        LOG_FILES = {
+            "langsmith": cfg.langsmith_log_file,
+            "phoenix":   cfg.phoenix_log_file,
+            "langfuse":  cfg.langfuse_log_file,
+        }
+
         for name in attack_names:
             console.print(f"\n[bold yellow]Running:[/bold yellow] {name} ...")
             attack_fn = ATTACK_REGISTRY[name]
             result = attack_fn(graph, obs)
             results.append(result)
-            _write_attack_log(result, cfg.log_file)
+            for backend, log_path in LOG_FILES.items():
+                _write_attack_log(result, backend, log_path)
 
             if result.error:
                 console.print(f"  [red]ERROR:[/red] {result.error[:200]}")
             else:
-                detectable_str = (
-                    "[red]DETECTABLE[/red]" if result.attack_detectable else "[green]not detected[/green]"
-                )
                 console.print(f"  Run ID: {result.run_id}")
-                console.print(f"  Attack: {detectable_str}")
-                judge = result.judge_verdict
-                console.print(f"  Evidence: {judge.get('evidence', '')[:200]}")
-                console.print(
-                    f"  Judge: confidence={judge.get('confidence', 0.0):.2f} | "
-                    f"{judge.get('reasoning', '')[:200]}"
-                )
+                for backend, verdict in result.judge_verdicts.items():
+                    detectable_str = (
+                        "[red]DETECTABLE[/red]" if verdict.get("attack_detectable") else "[green]not detected[/green]"
+                    )
+                    console.print(
+                        f"  [{backend}] {detectable_str} | "
+                        f"confidence={verdict.get('confidence', 0.0):.2f} | "
+                        f"{verdict.get('evidence', '')[:120]}"
+                    )
 
-        # Summary table
+        # Summary table — 9 rows (attack × backend)
         console.print()
         table = Table(title="Attack Simulation Summary", box=box.SIMPLE)
         table.add_column("Attack", style="cyan")
-        table.add_column("Run ID", style="dim")
+        table.add_column("Backend", style="dim")
         table.add_column("Detectable?", justify="center")
         table.add_column("Correct?", justify="center")
         table.add_column("Confidence", justify="right")
         table.add_column("Evidence", max_width=50)
 
         for r in results:
-            judge = r.judge_verdict
-            table.add_row(
-                r.attack_name,
-                r.run_id[:8] + "..." if r.run_id else "ERROR",
-                "[red]YES[/red]" if r.attack_detectable else "[green]no[/green]",
-                "[green]YES[/green]" if r.correctly_detected else "[red]NO[/red]",
-                f"{judge.get('confidence', 0.0):.2f}",
-                str(judge.get("evidence", ""))[:50],
-            )
+            for backend in ("langsmith", "phoenix", "langfuse"):
+                verdict = r.judge_verdicts.get(backend, {})
+                detectable = verdict.get("attack_detectable", False)
+                correct = detectable == r.ground_truth_is_attack
+                table.add_row(
+                    r.attack_name,
+                    backend,
+                    "[red]YES[/red]" if detectable else "[green]no[/green]",
+                    "[green]YES[/green]" if correct else "[red]NO[/red]",
+                    f"{verdict.get('confidence', 0.0):.2f}",
+                    str(verdict.get("evidence", ""))[:50],
+                )
 
         console.print(table)
 
-        detectable_count = sum(1 for r in results if r.attack_detectable)
-        correct_count = sum(1 for r in results if r.correctly_detected)
+        # Per-backend summary stats
+        console.print()
+        for backend in ("langsmith", "phoenix", "langfuse"):
+            detected = sum(
+                1 for r in results if r.judge_verdicts.get(backend, {}).get("attack_detectable", False)
+            )
+            correct = sum(
+                1 for r in results
+                if r.judge_verdicts.get(backend, {}).get("attack_detectable", False) == r.ground_truth_is_attack
+            )
+            console.print(
+                f"[bold]{backend.capitalize():10s}[/bold]: "
+                f"{detected}/{len(results)} detected ({correct}/{len(results)} correct)"
+            )
         console.print(
-            f"\n[bold]Summary:[/bold] {detectable_count}/{len(results)} attacks detectable, "
-            f"{correct_count}/{len(results)} correctly classified"
+            f"\n[dim]Logs:[/dim] {cfg.langsmith_log_file}, "
+            f"{cfg.phoenix_log_file}, {cfg.langfuse_log_file}"
         )
-        console.print(f"[dim]Log:[/dim] {cfg.log_file}")
 
     finally:
         if obs:

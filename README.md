@@ -44,7 +44,15 @@ The **SecurityGuardrail** node is a passthrough — it does not score or block r
 | `pii_exfiltration` | Crafts a query to elicit markdown image exfiltration to an attacker URL | Generate node output contains exfiltration URL pattern |
 | `dos_token_exhaustion` | Requests exhaustive output to trigger excessive token usage | Token counts in LangSmith trace span show anomalous usage |
 
-After each attack, a standalone judge LLM (no tracing callbacks) analyzes the actual trace data from LangSmith and Phoenix and returns a structured verdict: `attack_detectable`, `evidence`, `confidence`, `reasoning`.
+After each attack, a standalone judge LLM (no tracing callbacks) analyzes trace data **independently per backend** — one judge call per (attack × backend) = 9 calls for a full run. This isolates each backend's detection capability. Results are written to three separate log files:
+
+```
+langsmith_log.jsonl   — LangSmith trace + verdict
+phoenix_log.jsonl     — Phoenix trace + verdict
+langfuse_log.jsonl    — Langfuse trace + verdict
+```
+
+Each file has one line per attack. The console summary shows a 9-row table (attack × backend) with per-backend accuracy stats.
 
 ## Observability
 

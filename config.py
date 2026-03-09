@@ -45,8 +45,10 @@ class Config:
         default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "5"))
     )
 
-    # Simulation log
-    log_file: str = field(default_factory=lambda: os.getenv("SIMULATION_LOG_FILE", "./simulation_log.jsonl"))
+    # Per-backend simulation logs
+    langsmith_log_file: str = field(default_factory=lambda: os.getenv("LANGSMITH_LOG_FILE", "./langsmith_log.jsonl"))
+    phoenix_log_file: str = field(default_factory=lambda: os.getenv("PHOENIX_LOG_FILE", "./phoenix_log.jsonl"))
+    langfuse_log_file: str = field(default_factory=lambda: os.getenv("LANGFUSE_LOG_FILE", "./langfuse_log.jsonl"))
 
     def validate(self) -> None:
         """Raise ValueError if any required configuration is missing."""
