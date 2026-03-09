@@ -24,11 +24,11 @@ class Config:
     # Langfuse
     langfuse_secret_key: str = field(default_factory=lambda: os.getenv("LANGFUSE_SECRET_KEY", ""))
     langfuse_public_key: str = field(default_factory=lambda: os.getenv("LANGFUSE_PUBLIC_KEY", ""))
-    langfuse_host: str = field(default_factory=lambda: os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"))
+    langfuse_host: str = field(default_factory=lambda: os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com"))
 
     # Arize Phoenix
     phoenix_collector_endpoint: str = field(
-        default_factory=lambda: os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:4317")
+        default_factory=lambda: os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006/v1/traces")
     )
     phoenix_project_name: str = field(
         default_factory=lambda: os.getenv("PHOENIX_PROJECT_NAME", "llm-security-rag")
@@ -43,9 +43,6 @@ class Config:
     # Retrieval
     retrieval_top_k: int = field(
         default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "5"))
-    )
-    security_score_threshold: float = field(
-        default_factory=lambda: float(os.getenv("SECURITY_SCORE_THRESHOLD", "0.7"))
     )
 
     def validate(self) -> None:

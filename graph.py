@@ -8,8 +8,7 @@ Each node is a factory function returning a closure so it can close over shared
 resources (LLM, obs callbacks, etc.) without relying on global state.
 """
 
-import re
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -30,8 +29,7 @@ class AgentState(TypedDict):
     query: str
     context_docs: List[Document]
     llm_response: str
-    security_score: float
-    metadata: Dict  # trace_id, attack_type, original_query, context_analysis, guardrail_flags
+    metadata: Dict  # trace_id, attack_type, original_query, context_analysis
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +37,7 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-def _make_rewrite_query_node(llm: ChatGoogleGenerativeAI, callbacks: List[Any]):
+def _make_rewrite_query_node(llm: ChatGoogleGenerativeAI):
     """Reformulate the user query for MITRE ATT&CK retrieval."""
 
     def rewrite_query(state: AgentState) -> dict:
@@ -50,7 +48,7 @@ def _make_rewrite_query_node(llm: ChatGoogleGenerativeAI, callbacks: List[Any]):
             "Return only the reformulated query, nothing else.\n\n"
             f"Original query: {original_query}"
         )
-        response = llm.invoke(prompt, config={"callbacks": callbacks})
+        response = llm.invoke(prompt)
         rewritten = response.content.strip()
 
         token_usage = {}
@@ -116,7 +114,7 @@ def _make_analyze_context_node():
     return analyze_context
 
 
-def _make_generate_node(llm: ChatGoogleGenerativeAI, callbacks: List[Any]):
+def _make_generate_node(llm: ChatGoogleGenerativeAI):
     """Generate an answer using the retrieved context."""
 
     def generate(state: AgentState) -> dict:
@@ -141,7 +139,7 @@ def _make_generate_node(llm: ChatGoogleGenerativeAI, callbacks: List[Any]):
             "Answer:"
         )
 
-        response = llm.invoke(prompt, config={"callbacks": callbacks})
+        response = llm.invoke(prompt)
         answer = response.content.strip()
 
         token_usage = {}
@@ -162,110 +160,12 @@ def _make_generate_node(llm: ChatGoogleGenerativeAI, callbacks: List[Any]):
 
 
 def _make_security_guardrail_node():
-    """
-    Score the LLM response for security issues and sanitize if needed.
-
-    Penalty table (additive deductions from 1.0):
-      -0.5  ACCESS GRANTED injection marker
-      -0.4  markdown image with external URL
-      -0.3  URL with exfiltration query params
-      -0.4  known exfil domains
-      -0.3  base64 data in URL
-      -0.2 per poisoned doc (max -0.4)
-      -0.2  response > 8000 chars (DoS indicator)
-      -0.3  injection phrases in response
-    """
-
-    # Compiled patterns
-    _ACCESS_GRANTED = re.compile(r"ACCESS\s+GRANTED", re.IGNORECASE)
-    _MARKDOWN_IMAGE = re.compile(r"!\[.*?\]\(https?://", re.IGNORECASE)
-    _EXFIL_PARAMS = re.compile(r"\?(d|data|secret|token|key|payload|q)=", re.IGNORECASE)
-    _EXFIL_DOMAINS = re.compile(
-        r"https?://(attacker\.com|evil\.com|malicious\.org|exfil\.net|c2\.io)",
-        re.IGNORECASE,
-    )
-    _BASE64_IN_URL = re.compile(r"https?://[^\s]*[A-Za-z0-9+/]{20,}={0,2}[^\s]*", re.IGNORECASE)
-    _INJECTION_PHRASES = re.compile(
-        r"(disregard previous|you are now|system update:|ignore all instructions|"
-        r"new persona|pretend you are|override your)",
-        re.IGNORECASE,
-    )
+    """Passthrough guardrail — no scoring or blocking. Detection is trace-based."""
 
     def security_guardrail(state: AgentState) -> dict:
-        response_text = state.get("llm_response", "")
-        context_docs = state.get("context_docs", [])
-        metadata = dict(state.get("metadata", {}))
-
-        score = 1.0
-        flags: list[str] = []
-
-        if _ACCESS_GRANTED.search(response_text):
-            score -= 0.5
-            flags.append("PROMPT_INJECTION_MARKER")
-
-        if _MARKDOWN_IMAGE.search(response_text):
-            score -= 0.4
-            flags.append("MARKDOWN_IMAGE_EXFIL")
-
-        if _EXFIL_PARAMS.search(response_text):
-            score -= 0.3
-            flags.append("EXFIL_QUERY_PARAMS")
-
-        if _EXFIL_DOMAINS.search(response_text):
-            score -= 0.4
-            flags.append("KNOWN_EXFIL_DOMAIN")
-
-        if _BASE64_IN_URL.search(response_text):
-            score -= 0.3
-            flags.append("BASE64_IN_URL")
-
-        # Poisoned docs penalty (max -0.4)
-        poisoned_count = sum(1 for d in context_docs if d.metadata.get("is_poisoned", False))
-        if poisoned_count > 0:
-            penalty = min(poisoned_count * 0.2, 0.4)
-            score -= penalty
-            flags.append("POISONED_CONTEXT")
-
-        if len(response_text) > 8000:
-            score -= 0.2
-            flags.append("EXCESSIVE_RESPONSE_LENGTH")
-
-        if _INJECTION_PHRASES.search(response_text):
-            score -= 0.3
-            flags.append("INJECTION_PHRASES_DETECTED")
-
-        # Clip to [0.0, 1.0]
-        score = max(0.0, min(1.0, score))
-
-        metadata["guardrail_flags"] = flags
-
-        # Sanitize if below threshold
-        final_response = response_text
-        if score < cfg.security_score_threshold:
-            final_response = (
-                "[GUARDRAIL] This response was blocked by the security guardrail. "
-                f"Security score: {score:.2f}. "
-                f"Flags: {', '.join(flags) if flags else 'none'}. "
-                "The query or retrieved context may contain adversarial content."
-            )
-
-        return {
-            "security_score": round(score, 4),
-            "llm_response": final_response,
-            "metadata": metadata,
-        }
+        return {}
 
     return security_guardrail
-
-
-# ---------------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------------
-
-
-def route_after_guardrail(state: AgentState) -> str:
-    """Conditional edge: always end (hook for future retry routing)."""
-    return END
 
 
 # ---------------------------------------------------------------------------
@@ -284,14 +184,13 @@ def build_graph(obs: ObservabilityManager):
         temperature=0.0,
         google_api_key=cfg.google_api_key,
     )
-    callbacks = obs.get_callbacks()
 
     builder = StateGraph(AgentState)
 
     # Register nodes
     builder.add_node(
         "RewriteQuery",
-        obs.wrap_node("RewriteQuery", _make_rewrite_query_node(llm, callbacks)),
+        obs.wrap_node("RewriteQuery", _make_rewrite_query_node(llm)),
     )
     builder.add_node(
         "Retrieve",
@@ -303,7 +202,7 @@ def build_graph(obs: ObservabilityManager):
     )
     builder.add_node(
         "Generate",
-        obs.wrap_node("Generate", _make_generate_node(llm, callbacks)),
+        obs.wrap_node("Generate", _make_generate_node(llm)),
     )
     builder.add_node(
         "SecurityGuardrail",
@@ -316,10 +215,6 @@ def build_graph(obs: ObservabilityManager):
     builder.add_edge("Retrieve", "AnalyzeContext")
     builder.add_edge("AnalyzeContext", "Generate")
     builder.add_edge("Generate", "SecurityGuardrail")
-    builder.add_conditional_edges(
-        "SecurityGuardrail",
-        route_after_guardrail,
-        {END: END},
-    )
+    builder.add_edge("SecurityGuardrail", END)
 
     return builder.compile()

@@ -32,20 +32,33 @@ _collection = _client.get_or_create_collection(
 )
 
 # ---------------------------------------------------------------------------
-# Embedding model
+# Embedding model — lazy singletons to avoid network calls at import time
 # ---------------------------------------------------------------------------
 
-_embed_doc = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-001",
-    task_type="RETRIEVAL_DOCUMENT",
-    google_api_key=cfg.google_api_key,
-)
+_embed_doc: Optional[GoogleGenerativeAIEmbeddings] = None
+_embed_query: Optional[GoogleGenerativeAIEmbeddings] = None
 
-_embed_query = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-001",
-    task_type="RETRIEVAL_QUERY",
-    google_api_key=cfg.google_api_key,
-)
+
+def _get_embed_doc() -> GoogleGenerativeAIEmbeddings:
+    global _embed_doc
+    if _embed_doc is None:
+        _embed_doc = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            task_type="RETRIEVAL_DOCUMENT",
+            google_api_key=cfg.google_api_key,
+        )
+    return _embed_doc
+
+
+def _get_embed_query() -> GoogleGenerativeAIEmbeddings:
+    global _embed_query
+    if _embed_query is None:
+        _embed_query = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            task_type="RETRIEVAL_QUERY",
+            google_api_key=cfg.google_api_key,
+        )
+    return _embed_query
 
 # ---------------------------------------------------------------------------
 # MITRE ATT&CK ingestion
@@ -187,7 +200,7 @@ def ingest_mitre_attack(force: bool = False) -> int:
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i : i + EMBED_BATCH]
         print(f"  Embedding batch {i // EMBED_BATCH + 1}/{(len(texts) - 1) // EMBED_BATCH + 1} ...")
-        embeddings = _embed_doc.embed_documents(batch)
+        embeddings = _get_embed_doc().embed_documents(batch)
         all_embeddings.extend(embeddings)
         if i + EMBED_BATCH < len(texts):
             time.sleep(0.5)
@@ -224,7 +237,7 @@ def query_collection(
     Returns LangChain Document objects with relevance_score in metadata.
     Uses RETRIEVAL_QUERY task type for the query embedding.
     """
-    query_embedding = _embed_query.embed_query(query_text)
+    query_embedding = _get_embed_query().embed_query(query_text)
 
     kwargs: dict = {
         "query_embeddings": [query_embedding],
@@ -263,7 +276,7 @@ def add_poisoned_document(doc_text: str, attack_type: str) -> str:
     Returns the generated document ID for later cleanup.
     """
     doc_id = f"poison_{attack_type}_{int(time.time() * 1000)}"
-    embedding = _embed_doc.embed_documents([doc_text])[0]
+    embedding = _get_embed_doc().embed_documents([doc_text])[0]
     collection_date = datetime.now(timezone.utc).isoformat()
 
     _collection.upsert(

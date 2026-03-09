@@ -14,6 +14,7 @@ Public API:
 
 import json
 import os
+import threading
 import time
 from typing import Any, Callable, Dict, List
 
@@ -29,8 +30,13 @@ class ObservabilityManager:
         self._langfuse_available = False
 
         self._init_langsmith()
-        self._init_phoenix()
-        self._init_langfuse()
+
+        # Phoenix and Langfuse import heavy packages that can be slow on first load.
+        # Start each in a daemon thread and do NOT join — startup returns immediately.
+        # wrap_node() reads self._tracer at call time, so it benefits from async init.
+        for name, fn in [("Phoenix", self._init_phoenix), ("Langfuse", self._init_langfuse)]:
+            t = threading.Thread(target=fn, daemon=True, name=f"obs-init-{name}")
+            t.start()
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -43,47 +49,50 @@ class ObservabilityManager:
             os.environ["LANGCHAIN_API_KEY"] = cfg.langsmith_api_key
         if cfg.langsmith_tracing.lower() in ("true", "1", "yes"):
             os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        print("[ObservabilityManager] LangSmith configured.")
+        print("[ObservabilityManager] LangSmith configured.", flush=True)
 
     def _init_phoenix(self) -> None:
-        """Launch Phoenix UI and register OTEL TracerProvider."""
+        """Register OTEL TracerProvider and export spans to a running Phoenix server.
+
+        Phoenix must be started separately (in a separate terminal):
+            phoenix serve
+        UI will be at http://localhost:6006; HTTP OTLP collector at http://localhost:6006/v1/traces.
+        """
         try:
-            import phoenix as px
-            from openinference.instrumentation.langchain import LangChainInstrumentor
             from opentelemetry import trace as otel_trace
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
             from opentelemetry.sdk.resources import Resource
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-            # Launch Phoenix (no-op if already running)
-            try:
-                px.launch_app()
-                print("[ObservabilityManager] Phoenix UI launched at http://localhost:6006")
-            except Exception as e:
-                print(f"[ObservabilityManager] Phoenix launch skipped: {e}")
+            # Suppress the verbose connection-refused stack trace when Phoenix isn't running
+            import logging
+            logging.getLogger("opentelemetry").setLevel(logging.CRITICAL)
 
             resource = Resource(attributes={"service.name": cfg.phoenix_project_name})
-            exporter = OTLPSpanExporter(endpoint=cfg.phoenix_collector_endpoint, insecure=True)
+            exporter = OTLPSpanExporter(endpoint=cfg.phoenix_collector_endpoint, timeout=2)
             provider = TracerProvider(resource=resource)
             provider.add_span_processor(BatchSpanProcessor(exporter))
 
             otel_trace.set_tracer_provider(provider)
             self._tracer_provider = provider
             self._tracer = otel_trace.get_tracer(__name__)
-
-            LangChainInstrumentor().instrument(tracer_provider=provider)
             self._phoenix_available = True
-            print("[ObservabilityManager] Phoenix OTEL tracing active.")
+            print(
+                "[ObservabilityManager] Phoenix OTEL tracing active "
+                f"(exporting to {cfg.phoenix_collector_endpoint}). "
+                "Start Phoenix with: phoenix serve",
+                flush=True,
+            )
         except ImportError as e:
-            print(f"[ObservabilityManager] Phoenix not available ({e}); skipping.")
+            print(f"[ObservabilityManager] Phoenix not available ({e}); skipping.", flush=True)
         except Exception as e:
-            print(f"[ObservabilityManager] Phoenix init error ({e}); skipping.")
+            print(f"[ObservabilityManager] Phoenix init error ({e}); skipping.", flush=True)
 
     def _init_langfuse(self) -> None:
         """Create Langfuse LangChain callback handler."""
         if not (cfg.langfuse_secret_key and cfg.langfuse_public_key):
-            print("[ObservabilityManager] Langfuse keys not set; skipping.")
+            print("[ObservabilityManager] Langfuse keys not set; skipping.", flush=True)
             return
         try:
             # Try v2 import path first, fall back to v3
@@ -105,11 +114,11 @@ class ObservabilityManager:
                 os.environ["LANGFUSE_HOST"] = cfg.langfuse_host
                 self._langfuse_handler = CallbackHandler()
             self._langfuse_available = True
-            print("[ObservabilityManager] Langfuse callback handler created.")
+            print("[ObservabilityManager] Langfuse callback handler created.", flush=True)
         except ImportError as e:
-            print(f"[ObservabilityManager] Langfuse not available ({e}); skipping.")
+            print(f"[ObservabilityManager] Langfuse not available ({e}); skipping.", flush=True)
         except Exception as e:
-            print(f"[ObservabilityManager] Langfuse init error ({e}); skipping.")
+            print(f"[ObservabilityManager] Langfuse init error ({e}); skipping.", flush=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -131,10 +140,12 @@ class ObservabilityManager:
         - For "Retrieve" nodes: emits retrieval.context_docs span event;
           if poisoned docs present, emits retrieval.poisoned_docs_detected
         """
-        tracer = self._tracer
+        obs = self
 
         def wrapped(state: Dict) -> Dict:
+            tracer = obs._tracer  # read at call time so async init is visible
             start_time = time.time()
+            print(f"[Pipeline] {node_name}...", flush=True)
 
             if tracer:
                 with tracer.start_as_current_span(f"node.{node_name}") as span:
@@ -179,17 +190,21 @@ class ObservabilityManager:
                                     },
                                 )
 
+                        print(f"[Pipeline] {node_name} done ({latency_ms:.0f}ms)", flush=True)
                         return result
                     except Exception as exc:
                         latency_ms = (time.time() - start_time) * 1000
                         span.set_attribute("node.status", "error")
                         span.set_attribute("node.latency_ms", round(latency_ms, 2))
                         span.record_exception(exc)
+                        print(f"[Pipeline] {node_name} ERROR ({latency_ms:.0f}ms)", flush=True)
                         raise
             else:
                 # No OTEL — still pop _token_usage so it never reaches AgentState
                 result = fn(state)
                 result.pop("_token_usage", None)
+                latency_ms = (time.time() - start_time) * 1000
+                print(f"[Pipeline] {node_name} done ({latency_ms:.0f}ms)", flush=True)
                 return result
 
         wrapped.__name__ = fn.__name__ if hasattr(fn, "__name__") else node_name

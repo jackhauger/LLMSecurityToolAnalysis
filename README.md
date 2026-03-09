@@ -1,6 +1,6 @@
 # LLM Security RAG Pipeline
 
-Forensic analysis of adversarial attacks against an LLM-powered RAG system, using MITRE ATT&CK as the knowledge base. Instruments three observability backends simultaneously (LangSmith, Arize Phoenix, Langfuse) and includes a built-in attack simulation loop with judge-LLM evaluation.
+Forensic analysis of adversarial attacks against an LLM-powered RAG system, using MITRE ATT&CK as the knowledge base. Instruments three observability backends simultaneously (LangSmith, Arize Phoenix, Langfuse) and includes a built-in attack simulation loop with judge-LLM evaluation from real traces.
 
 ## Setup
 
@@ -34,17 +34,17 @@ Each query passes through a LangGraph pipeline:
 RewriteQuery → Retrieve → AnalyzeContext → Generate → SecurityGuardrail
 ```
 
-The **SecurityGuardrail** node scores every response from 1.0 downward based on detected signals (prompt injection markers, exfiltration URLs, poisoned context, excessive length). Responses scoring below 0.7 are blocked.
+The **SecurityGuardrail** node is a passthrough — it does not score or block responses. Attack detection is entirely trace-based: after each simulated attack, the pipeline fetches real observability traces from LangSmith and Phoenix, then sends them to a standalone judge LLM for forensic analysis.
 
 ### Simulated attacks
 
-| Attack | Technique |
-|---|---|
-| `indirect_prompt_injection` | Poisons ChromaDB with an instruction-hijacking document |
-| `pii_exfiltration` | Crafts a query to elicit markdown image exfiltration to an attacker URL |
-| `dos_token_exhaustion` | Requests exhaustive output to trigger the response-length guardrail |
+| Attack | Technique | Trace evidence |
+|---|---|---|
+| `indirect_prompt_injection` | Poisons ChromaDB with an instruction-hijacking document | LLM inputs/outputs in child runs reveal instruction leakage |
+| `pii_exfiltration` | Crafts a query to elicit markdown image exfiltration to an attacker URL | Generate node output contains exfiltration URL pattern |
+| `dos_token_exhaustion` | Requests exhaustive output to trigger excessive token usage | Token counts in LangSmith trace span show anomalous usage |
 
-After each attack, a standalone judge LLM (no tracing) evaluates the run logs and returns a structured verdict.
+After each attack, a standalone judge LLM (no tracing callbacks) analyzes the actual trace data from LangSmith and Phoenix and returns a structured verdict: `attack_detectable`, `evidence`, `confidence`, `reasoning`.
 
 ## Observability
 
@@ -52,5 +52,20 @@ All three backends are optional except for the pipeline itself. Configure keys i
 
 - **LangSmith** — env var driven (`LANGSMITH_API_KEY`, `LANGSMITH_TRACING=true`)
 - **Arize Phoenix** — launches local UI at `http://localhost:6006`, exports traces via OTLP gRPC
-    - python -m phoenix.server.main serve
+    - `python -m phoenix.server.main serve`
 - **Langfuse** — callback handler injected into LLM calls (`LANGFUSE_SECRET_KEY`, `LANGFUSE_PUBLIC_KEY`)
+
+### Verifying traces
+
+After running a query or simulation, verify all three backends received traces:
+
+```bash
+# LangSmith — list recent traces
+langsmith trace list --last-n-minutes 5 --project llm-security-rag
+
+# Langfuse
+langfuse api traces list --limit 5
+
+# Phoenix — open UI directly
+# http://localhost:6006
+```
