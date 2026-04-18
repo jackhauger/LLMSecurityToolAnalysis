@@ -2,6 +2,6 @@
 .env
 __pycache__/
 chroma_db
-CLAUDE.md
+*claude*
 *.json
 *.jsonl
