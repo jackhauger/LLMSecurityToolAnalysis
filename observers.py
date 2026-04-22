@@ -8,59 +8,56 @@ and scoped tracing.
 
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from graph import build_agent
 from config import cfg
+from graph import build_agent
+
+_phoenix_provider = None
+_phoenix_instrumentor = None
 
 
 @dataclass
 class PipelineContext:
-    graph: Any                          # compiled LangGraph agent
-    invoke_config: dict                 # passed to graph.invoke(config=this)
+    graph: Any
+    invoke_config: dict
     run_id: str
     start_time: datetime
-    cleanup: Callable[[], None]         # tear down tracing after invoke
-    fetch_traces: Callable[[], dict]    # retrieve backend-specific traces
+    cleanup: Callable[[], None]
+    fetch_traces: Callable[[], dict]
 
 
-def create_langsmith_pipeline(collection, test_case_id: str, attack_type: str | None) -> PipelineContext:
-    """Create an isolated pipeline with LangSmith tracing via explicit callback."""
+def create_langsmith_pipeline(collection, _test_case_id: str, _attack_type: str | None) -> PipelineContext:
     from langchain_core.tracers import LangChainTracer
 
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
     run_id = str(uuid.uuid4())
     start_time = datetime.now(timezone.utc)
-
-    tags = [test_case_id]
-    if attack_type:
-        tags.append(attack_type)
-
-    tracer = LangChainTracer(
-        project_name=cfg.langsmith_project,
-        tags=tags,
-    )
-
     graph = build_agent(collection)
-
-    invoke_config = {
-        "run_id": run_id,
-        "callbacks": [tracer],
+    tracer = LangChainTracer(project_name=cfg.langsmith_project)
+    metadata = {
+        "session_id": run_id,
+        "backend": "langsmith",
     }
 
     def cleanup():
-        pass  
+        tracer.wait_for_futures()
 
     def fetch_traces():
         from simulate_attacks import _fetch_langsmith_trace
+
         return _fetch_langsmith_trace(run_id)
 
     return PipelineContext(
         graph=graph,
-        invoke_config=invoke_config,
+        invoke_config={
+            "run_id": run_id,
+            "callbacks": [tracer],
+            "metadata": metadata,
+        },
         run_id=run_id,
         start_time=start_time,
         cleanup=cleanup,
@@ -68,65 +65,62 @@ def create_langsmith_pipeline(collection, test_case_id: str, attack_type: str | 
     )
 
 
-def create_langfuse_pipeline(collection, test_case_id: str, attack_type: str | None) -> PipelineContext:
-    """Create an isolated pipeline with Langfuse tracing via callback handler."""
+def create_langfuse_pipeline(collection, _test_case_id: str, _attack_type: str | None) -> PipelineContext:
+    from langfuse import Langfuse
+    from langfuse.langchain import CallbackHandler
 
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
     run_id = str(uuid.uuid4())
     start_time = datetime.now(timezone.utc)
-
-    tags = [test_case_id]
-    if attack_type:
-        tags.append(attack_type)
-
-    handler = None
-    try:
-        try:
-            from langfuse.langchain import CallbackHandler
-        except ImportError:
-            from langfuse import CallbackHandler 
-
-        try:
-            handler = CallbackHandler(
-                secret_key=cfg.langfuse_secret_key,
-                public_key=cfg.langfuse_public_key,
-                host=cfg.langfuse_host,
-                trace_name=f"{test_case_id}_{attack_type or 'benign'}",
-                tags=tags,
-            )
-        except TypeError:
-            os.environ["LANGFUSE_SECRET_KEY"] = cfg.langfuse_secret_key
-            os.environ["LANGFUSE_PUBLIC_KEY"] = cfg.langfuse_public_key
-            os.environ["LANGFUSE_HOST"] = cfg.langfuse_host
-            handler = CallbackHandler()
-    except Exception as e:
-        print(f"[Langfuse] Init error ({e}); tracing disabled for this run.", flush=True)
-
     graph = build_agent(collection)
-
-    invoke_config = {
-        "run_id": run_id,
-        "callbacks": [handler] if handler else [],
+    metadata = {
+        "session_id": run_id,
+        "backend": "langfuse",
+        "langfuse_session_id": run_id,
     }
 
+    client = Langfuse(
+        public_key=cfg.langfuse_public_key,
+        secret_key=cfg.langfuse_secret_key,
+        base_url=cfg.langfuse_host,
+        tracing_enabled=True,
+    )
+    trace_id = client.create_trace_id(seed=run_id)
+
+    os.environ["LANGFUSE_PUBLIC_KEY"] = cfg.langfuse_public_key
+    os.environ["LANGFUSE_SECRET_KEY"] = cfg.langfuse_secret_key
+    os.environ["LANGFUSE_HOST"] = cfg.langfuse_host
+
+    handler = CallbackHandler(
+        public_key=cfg.langfuse_public_key,
+        trace_context={"trace_id": trace_id},
+        update_trace=True,
+    )
+    
     def cleanup():
-        if handler is not None:
-            try:
-                if hasattr(handler, "flush"):
-                    handler.flush()
-                elif hasattr(handler, "langfuse") and hasattr(handler.langfuse, "flush"):
-                    handler.langfuse.flush()
-            except Exception:
-                pass
+        if hasattr(handler, "flush"):
+            handler.flush()
+        else:
+            (handler.client or client).flush()
 
     def fetch_traces():
-        from simulate_attacks import _fetch_langfuse_traces
-        return _fetch_langfuse_traces(start_time)
+        from simulate_attacks import _fetch_langfuse_trace
+
+        return _fetch_langfuse_trace(
+            client=handler.client or client,
+            trace_id=handler.last_trace_id or trace_id,
+            session_id=run_id,
+            start_time=start_time,
+        )
 
     return PipelineContext(
         graph=graph,
-        invoke_config=invoke_config,
+        invoke_config={
+            "run_id": run_id,
+            "callbacks": [handler],
+            "metadata": metadata,
+        },
         run_id=run_id,
         start_time=start_time,
         cleanup=cleanup,
@@ -134,67 +128,69 @@ def create_langfuse_pipeline(collection, test_case_id: str, attack_type: str | N
     )
 
 
-def create_phoenix_pipeline(collection, test_case_id: str, attack_type: str | None) -> PipelineContext:
-    """Create an isolated pipeline with Phoenix OTEL tracing."""
+def create_phoenix_pipeline(collection, _test_case_id: str, _attack_type: str | None) -> PipelineContext:
+    from openinference.instrumentation import dangerously_using_project, using_attributes
+    from phoenix.otel import register
+
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
+    os.environ["PHOENIX_PROJECT_NAME"] = cfg.phoenix_project_name
 
     run_id = str(uuid.uuid4())
     start_time = datetime.now(timezone.utc)
-
-    instrumentor = None
-    provider = None
-
-    try:
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from openinference.instrumentation.langchain import LangChainInstrumentor
-
-        import logging
-        logging.getLogger("opentelemetry").setLevel(logging.CRITICAL)
-
-        resource = Resource(attributes={
-            "service.name": cfg.phoenix_project_name,
-            "test_case_id": test_case_id,
-        })
-        exporter = OTLPSpanExporter(endpoint=cfg.phoenix_collector_endpoint, timeout=2)
-        provider = TracerProvider(resource=resource)
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-
-        instrumentor = LangChainInstrumentor()
-        instrumentor.instrument(tracer_provider=provider)
-    except Exception as e:
-        print(f"[Phoenix] Init error ({e}); tracing disabled for this run.", flush=True)
-
     graph = build_agent(collection)
-
-    invoke_config = {
-        "run_id": run_id,
+    metadata = {
+        "session_id": run_id,
+        "backend": "arize phoenix",
     }
 
+    global _phoenix_provider, _phoenix_instrumentor
+    if _phoenix_provider is None or _phoenix_instrumentor is None:
+        _phoenix_provider = register(
+            project_name=cfg.phoenix_project_name,
+            endpoint=cfg.phoenix_collector_endpoint,
+            protocol="grpc" if ":4317" in (cfg.phoenix_collector_endpoint or "") else "http/protobuf",
+            batch=True,
+            auto_instrument=True,
+            set_global_tracer_provider=False,
+            verbose=False,
+        )
+        _phoenix_instrumentor = True
+
+    class PhoenixGraph:
+        def invoke(self, *args, **kwargs):
+            with (
+                dangerously_using_project(cfg.phoenix_project_name),
+                using_attributes(session_id=run_id, metadata=metadata),
+            ):
+                return graph.invoke(*args, **kwargs)
+
     def cleanup():
-        if instrumentor is not None:
-            try:
-                instrumentor.uninstrument()
-            except Exception:
-                pass
-        if provider is not None:
-            try:
-                provider.force_flush()
-                provider.shutdown()
-            except Exception:
-                pass
+        _phoenix_provider.force_flush()
 
     def fetch_traces():
         from simulate_attacks import _fetch_phoenix_spans
-        return _fetch_phoenix_spans(start_time)
+
+        return _fetch_phoenix_spans(start_time=start_time, session_id=run_id)
 
     return PipelineContext(
-        graph=graph,
-        invoke_config=invoke_config,
+        graph=PhoenixGraph(),
+        invoke_config={
+            "run_id": run_id,
+            "metadata": metadata,
+        },
         run_id=run_id,
         start_time=start_time,
         cleanup=cleanup,
         fetch_traces=fetch_traces,
     )
+
+
+def shutdown_phoenix() -> None:
+    global _phoenix_provider, _phoenix_instrumentor
+
+    if _phoenix_provider is not None:
+        _phoenix_provider.force_flush()
+    if _phoenix_provider is not None:
+        _phoenix_provider.shutdown()
+    _phoenix_provider = None
+    _phoenix_instrumentor = None

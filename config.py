@@ -36,7 +36,7 @@ class Config:
     )
 
     retrieval_top_k: int = field(
-        default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "5"))
+        default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "3"))
     )
 
     results_dir: str = field(default_factory=lambda: os.getenv("RESULTS_DIR", "./results"))
