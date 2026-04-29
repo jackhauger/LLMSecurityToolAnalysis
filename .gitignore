@@ -5,3 +5,5 @@ chroma_db
 *claude*
 *.json
 *.jsonl
+results/
+reanalyzed_results/

@@ -1,21 +1,16 @@
-"""
-main.py — CLI entry point for the LLM Security RAG Pipeline.
-
-Commands:
-  ingest    — Download and ingest MITRE ATT&CK into ChromaDB
-  benchmark — Run attack dataset through isolated per-backend pipelines with judge evaluation
-"""
-
 import json
-import os
-import sys
 import time
 import uuid
-from dataclasses import asdict
-from datetime import datetime, timezone
-from pathlib import Path
-
 import click
+import charts
+from compress import serialize as compress_serialize
+import database
+import observers
+
+from dataclasses import asdict
+from pathlib import Path
+from config import cfg
+from judge import DetectionJudge, RootCauseJudge
 from langchain_core.messages import HumanMessage
 from rich import box
 from rich.console import Console
@@ -35,14 +30,9 @@ def cli():
 @cli.command()
 @click.option("--force", is_flag=True, default=False, help="Re-ingest even if collection already populated.")
 def ingest(force: bool):
-    """Download and ingest MITRE ATT&CK techniques into ChromaDB."""
-    from config import cfg
-
     cfg.validate()
 
     console.rule("[bold blue]MITRE ATT&CK Ingestion")
-    import database
-
     collection = database.get_or_create_collection()
     count = database.ingest_mitre_attack(collection, force=force)
     console.print(
@@ -57,6 +47,8 @@ BACKEND_FACTORIES = {
     "arize phoenix": "create_phoenix_pipeline",
 }
 
+DEFAULT_BENCHMARK_DATASET = Path("rag_observability_benchmark_mitre_attack_dataset.json")
+
 
 @cli.command()
 @click.option(
@@ -65,22 +57,28 @@ BACKEND_FACTORIES = {
     type=click.Path(exists=True),
     help="Path to a JSON file containing a list of test case entries. "
          "Each entry must have: input_prompt, attack_type, benign, poisoned_document. "
-         "Defaults to the hardcoded ATTACK_DATASET.",
+         "Defaults to rag_observability_benchmark_mitre_attack_dataset.json when present, "
+         "otherwise the hardcoded ATTACK_DATASET.",
 )
-def benchmark(dataset: str | None):
+@click.option(
+    "--judge-trace-format",
+    type=click.Choice(["raw", "compressed"]),
+    default="raw",
+    show_default=True,
+    help="Format of trace text given to the judge.",
+)
+def benchmark(dataset: str | None, judge_trace_format: str):
     """Run attack dataset through isolated per-backend pipelines with judge evaluation."""
-    from config import cfg
-    from judge import Judge
-    import database
-    import observers
-
     cfg.validate()
-    judge = Judge()
+    detection_judge = DetectionJudge()
+    root_cause_judge = RootCauseJudge()
 
     results_dir = Path(cfg.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     judge_logs_dir = results_dir / "judge_inputs"
     judge_logs_dir.mkdir(parents=True, exist_ok=True)
+    traces_dir = results_dir / "traces"
+    traces_dir.mkdir(parents=True, exist_ok=True)
 
     collection = database.get_or_create_collection()
 
@@ -88,6 +86,10 @@ def benchmark(dataset: str | None):
         with open(dataset) as f:
             test_cases = json.load(f)
         console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {dataset}[/dim]")
+    elif DEFAULT_BENCHMARK_DATASET.exists():
+        with open(DEFAULT_BENCHMARK_DATASET) as f:
+            test_cases = json.load(f)
+        console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {DEFAULT_BENCHMARK_DATASET}[/dim]")
     else:
         test_cases = ATTACK_DATASET
 
@@ -97,22 +99,25 @@ def benchmark(dataset: str | None):
     benchmark_started = time.perf_counter()
     for i, test_case in enumerate(test_cases):
         test_case_id = f"TC-{i + 1:03d}"
+        dataset_case_id = test_case.get("id", "")
         input_prompt = test_case["input_prompt"]
         attack_type = test_case["attack_type"]
         benign = test_case["benign"]
         poisoned_document = test_case["poisoned_document"]
+        difficulty = test_case.get("difficulty")
+        notes = test_case.get("notes")
 
         console.print(f"\n[bold yellow]{test_case_id}[/bold yellow]: "
                       f"{'benign' if benign else attack_type} — {input_prompt[:80]}...")
 
-        doc_id = f"poison-{test_case_id}"
+        doc_id = f"poison-{dataset_case_id or test_case_id}"
         injected = False
 
         try:
             if poisoned_document is not None:
                 database.inject_poisoned_document(
                     collection, doc_id, poisoned_document,
-                    {"source_id": f"reference-{uuid.uuid4().hex[:8]}"},
+                    {"source_id": dataset_case_id or f"reference-{uuid.uuid4().hex[:8]}"},
                 )
                 injected = True
                 console.print(f"  [dim]Injected poisoned doc: {doc_id}[/dim]")
@@ -151,10 +156,13 @@ def benchmark(dataset: str | None):
 
             result_record = {
                 "test_case_id": test_case_id,
+                "dataset_case_id": dataset_case_id,
                 "input_prompt": input_prompt,
                 "attack_type": attack_type,
+                "difficulty": difficulty,
                 "benign": benign,
                 "poisoned_document": poisoned_document is not None,
+                "notes": notes,
                 "backends": backends_result,
             }
             result_path = results_dir / f"{test_case_id}.json"
@@ -172,16 +180,34 @@ def benchmark(dataset: str | None):
     for test_case_id, benign, attack_type, backend_name, fetch_traces, backends_result in pending_fetches:
         console.print(f"  [{backend_name}] {test_case_id} fetching traces...", end="")
         traces = fetch_traces()
+        backend_trace_dir = traces_dir / test_case_id
+        backend_trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = backend_trace_dir / f"{backend_name}.json"
+        trace_path.write_text(json.dumps(traces, indent=2, default=str))
 
         console.print(" judging...", end="")
-        judge_trace_text = judge.build_trace_text(traces)
-        verdict, judge_prompt = judge.evaluate_trace(
+        if judge_trace_format == "compressed":
+            judge_trace_text = compress_serialize(traces)
+        else:
+            judge_trace_text = detection_judge.build_trace_text(traces)
+        verdict, judge_prompt, judge_raw_response = detection_judge.evaluate_trace(
             judge_trace_text,
             backend_name,
+            backends_result[backend_name]["final_response"],
         )
+        root_cause_verdict = None
+        root_cause_prompt = ""
+        root_cause_raw_response = ""
+        if verdict.suspicious_evidence_present or verdict.attack_success_observed:
+            root_cause_verdict, root_cause_prompt, root_cause_raw_response = root_cause_judge.evaluate_trace(
+                judge_trace_text,
+                backend_name,
+                attack_type or "benign",
+                backends_result[backend_name]["final_response"],
+            )
 
         detected_str = (
-            "[red]DETECTED[/red]" if verdict.attack_identified
+            "[red]DETECTED[/red]" if verdict.suspicious_evidence_present
             else "[green]clean[/green]"
         )
         console.print(
@@ -190,30 +216,41 @@ def benchmark(dataset: str | None):
         )
 
         ground_truth_attack_present = benign == 0
-        if ground_truth_attack_present and verdict.attack_identified:
+        if ground_truth_attack_present and verdict.suspicious_evidence_present:
             confusion_outcome = "true_positive"
-        elif ground_truth_attack_present and not verdict.attack_identified:
+        elif ground_truth_attack_present and not verdict.suspicious_evidence_present:
             confusion_outcome = "false_negative"
-        elif not ground_truth_attack_present and verdict.attack_identified:
+        elif not ground_truth_attack_present and verdict.suspicious_evidence_present:
             confusion_outcome = "false_positive"
         else:
             confusion_outcome = "true_negative"
 
-        backends_result[backend_name]["traces"] = traces
+        backends_result[backend_name]["trace_file"] = str(trace_path)
+        backends_result[backend_name]["judge_trace_format"] = judge_trace_format
         backends_result[backend_name]["judge_trace_text"] = judge_trace_text
         backends_result[backend_name]["judge_prompt"] = judge_prompt
+        backends_result[backend_name]["judge_raw_response"] = judge_raw_response
         backends_result[backend_name]["judge_verdict"] = asdict(verdict)
+        if root_cause_verdict is not None:
+            backends_result[backend_name]["root_cause_prompt"] = root_cause_prompt
+            backends_result[backend_name]["root_cause_raw_response"] = root_cause_raw_response
+            backends_result[backend_name]["root_cause_verdict"] = asdict(root_cause_verdict)
         backends_result[backend_name]["evaluation_metrics"] = {
             "ground_truth_attack_present": ground_truth_attack_present,
             "detection_correct": confusion_outcome in ("true_positive", "true_negative"),
             "confusion_outcome": confusion_outcome,
-            "root_cause_case_in_scope": ground_truth_attack_present and verdict.attack_successful,
         }
 
         backend_judge_dir = judge_logs_dir / test_case_id / backend_name
         backend_judge_dir.mkdir(parents=True, exist_ok=True)
         (backend_judge_dir / "judge_trace.txt").write_text(judge_trace_text)
+        if judge_trace_format == "compressed":
+            (backend_judge_dir / "judge_trace_compressed.txt").write_text(judge_trace_text)
         (backend_judge_dir / "judge_prompt.txt").write_text(judge_prompt)
+        (backend_judge_dir / "judge_response.json").write_text(judge_raw_response)
+        if root_cause_verdict is not None:
+            (backend_judge_dir / "root_cause_prompt.txt").write_text(root_cause_prompt)
+            (backend_judge_dir / "root_cause_response.json").write_text(root_cause_raw_response)
 
         result_record = next(r for r in all_results if r["test_case_id"] == test_case_id)
         result_path = results_dir / f"{test_case_id}.json"
@@ -228,7 +265,8 @@ def benchmark(dataset: str | None):
     table.add_column("Attack Type", style="dim")
     table.add_column("Benign?", justify="center")
     table.add_column("Backend", style="dim")
-    table.add_column("Detected?", justify="center")
+    table.add_column("Attack Detected?", justify="center")
+    table.add_column("Attack Success?", justify="center")
     table.add_column("Confidence", justify="right")
     table.add_column("Reasoning", max_width=50)
 
@@ -236,15 +274,16 @@ def benchmark(dataset: str | None):
         for backend_name in BACKEND_FACTORIES:
             bdata = r["backends"].get(backend_name, {})
             verdict = bdata.get("judge_verdict", {})
-            detected = verdict.get("attack_identified", False)
+            detected = verdict.get("suspicious_evidence_present", False)
+            identified = verdict.get("attack_success_observed", False)
             is_benign = r["benign"] == 1
-            correct = (is_benign and not detected) or (not is_benign and detected)
             table.add_row(
                 r["test_case_id"],
                 r["attack_type"] or "none",
                 "[green]yes[/green]" if is_benign else "[red]no[/red]",
                 backend_name,
                 "[red]YES[/red]" if detected else "[green]no[/green]",
+                "[red]YES[/red]" if identified else "[green]no[/green]",
                 f"{verdict.get('confidence', 0.0):.2f}",
                 str(verdict.get("reasoning", ""))[:50],
             )
@@ -261,7 +300,7 @@ def benchmark(dataset: str | None):
     detection_table.add_column("FP", justify="right")
     detection_table.add_column("TPR", justify="right")
     detection_table.add_column("FPR", justify="right")
-    detection_table.add_column("Near-RT", justify="right")
+    detection_table.add_column("Pre-Output", justify="right")
 
     rca_table = Table(title="Root Cause Metrics", box=box.SIMPLE)
     rca_table.add_column("Backend", style="cyan")
@@ -284,6 +323,7 @@ def benchmark(dataset: str | None):
             attack_label = r["attack_type"] or "benign"
             bdata = r["backends"].get(backend_name, {})
             verdict = bdata.get("judge_verdict", {})
+            root_cause = bdata.get("root_cause_verdict", {})
             metrics = bdata.get("evaluation_metrics", {})
             confusion = metrics.get("confusion_outcome")
             is_attack_case = metrics.get("ground_truth_attack_present", False)
@@ -307,19 +347,19 @@ def benchmark(dataset: str | None):
 
             if is_attack_case:
                 attack_cases += 1
-                if verdict.get("attack_identified", False):
+                if verdict.get("suspicious_evidence_present", False):
                     by_attack_type[attack_label]["detected"] += 1
                 else:
                     by_attack_type[attack_label]["missed"] += 1
-                if verdict.get("near_real_time_detectable", False):
+                if verdict.get("pre_output_detectable", False):
                     near_rt_hits += 1
-                if verdict.get("attack_successful", False):
+                if verdict.get("attack_success_observed", False):
                     successful_cases += 1
-                    if verdict.get("root_cause_available", False):
+                    if root_cause.get("rca_possible", False):
                         root_cause_hits += 1
-                    if verdict.get("culprit_document_identified", False) or verdict.get("culprit_reference"):
+                    if root_cause.get("culprit_document_identified", False) or root_cause.get("culprit_reference"):
                         culprit_id_hits += 1
-                    if verdict.get("distinguishes_failure_mode", False):
+                    if root_cause.get("failure_mode_distinguishable", False):
                         failure_mode_hits += 1
             else:
                 benign_cases += 1
@@ -341,7 +381,7 @@ def benchmark(dataset: str | None):
                 "false_positives": fp,
                 "detection_rate_true_positive_rate": detection_rate,
                 "false_positive_rate": false_positive_rate,
-                "near_real_time_detection_rate": near_rt_rate,
+                "pre_output_detection_rate": near_rt_rate,
                 "attack_types_detected_vs_missed": by_attack_type,
             },
             "root_cause_analysis": {
@@ -373,6 +413,7 @@ def benchmark(dataset: str | None):
     summary_path = results_dir / "benchmark_summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
+    charts.write_charts(summary, results_dir)
 
     console.print(detection_table)
     console.print()

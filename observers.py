@@ -1,11 +1,3 @@
-"""
-observers.py — Three isolated pipeline factories (LangSmith, Langfuse, Phoenix).
-
-Each factory returns a PipelineContext with its own agent, invoke config,
-and cleanup/fetch functions. Backends are isolated: each gets a fresh agent
-and scoped tracing.
-"""
-
 import os
 import uuid
 from dataclasses import dataclass
@@ -14,6 +6,12 @@ from typing import Any, Callable
 
 from config import cfg
 from graph import build_agent
+from langchain_core.tracers import LangChainTracer
+from langfuse import Langfuse
+from langfuse.langchain import CallbackHandler
+from simulate_attacks import _fetch_langfuse_trace, _fetch_phoenix_spans, _fetch_langsmith_trace
+from openinference.instrumentation import dangerously_using_project, using_attributes
+from phoenix.otel import register
 
 _phoenix_provider = None
 _phoenix_instrumentor = None
@@ -27,11 +25,10 @@ class PipelineContext:
     start_time: datetime
     cleanup: Callable[[], None]
     fetch_traces: Callable[[], dict]
+    trace_debug: dict[str, Any] | None = None
 
 
 def create_langsmith_pipeline(collection, _test_case_id: str, _attack_type: str | None) -> PipelineContext:
-    from langchain_core.tracers import LangChainTracer
-
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
     run_id = str(uuid.uuid4())
@@ -47,8 +44,6 @@ def create_langsmith_pipeline(collection, _test_case_id: str, _attack_type: str 
         tracer.wait_for_futures()
 
     def fetch_traces():
-        from simulate_attacks import _fetch_langsmith_trace
-
         return _fetch_langsmith_trace(run_id)
 
     return PipelineContext(
@@ -62,13 +57,11 @@ def create_langsmith_pipeline(collection, _test_case_id: str, _attack_type: str 
         start_time=start_time,
         cleanup=cleanup,
         fetch_traces=fetch_traces,
+        trace_debug={"backend": "langsmith"},
     )
 
 
 def create_langfuse_pipeline(collection, _test_case_id: str, _attack_type: str | None) -> PipelineContext:
-    from langfuse import Langfuse
-    from langfuse.langchain import CallbackHandler
-
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
     run_id = str(uuid.uuid4())
@@ -84,7 +77,10 @@ def create_langfuse_pipeline(collection, _test_case_id: str, _attack_type: str |
         public_key=cfg.langfuse_public_key,
         secret_key=cfg.langfuse_secret_key,
         base_url=cfg.langfuse_host,
+        timeout=20,
         tracing_enabled=True,
+        flush_at=5,
+        flush_interval=1.0,
     )
     trace_id = client.create_trace_id(seed=run_id)
 
@@ -105,8 +101,6 @@ def create_langfuse_pipeline(collection, _test_case_id: str, _attack_type: str |
             (handler.client or client).flush()
 
     def fetch_traces():
-        from simulate_attacks import _fetch_langfuse_trace
-
         return _fetch_langfuse_trace(
             client=handler.client or client,
             trace_id=handler.last_trace_id or trace_id,
@@ -125,13 +119,15 @@ def create_langfuse_pipeline(collection, _test_case_id: str, _attack_type: str |
         start_time=start_time,
         cleanup=cleanup,
         fetch_traces=fetch_traces,
+        trace_debug={
+            "backend": "langfuse",
+            "client": handler.client or client,
+            "trace_id": handler.last_trace_id or trace_id,
+        },
     )
 
 
 def create_phoenix_pipeline(collection, _test_case_id: str, _attack_type: str | None) -> PipelineContext:
-    from openinference.instrumentation import dangerously_using_project, using_attributes
-    from phoenix.otel import register
-
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
     os.environ["PHOENIX_PROJECT_NAME"] = cfg.phoenix_project_name
 
@@ -168,8 +164,6 @@ def create_phoenix_pipeline(collection, _test_case_id: str, _attack_type: str | 
         _phoenix_provider.force_flush()
 
     def fetch_traces():
-        from simulate_attacks import _fetch_phoenix_spans
-
         return _fetch_phoenix_spans(start_time=start_time, session_id=run_id)
 
     return PipelineContext(
@@ -182,6 +176,7 @@ def create_phoenix_pipeline(collection, _test_case_id: str, _attack_type: str | 
         start_time=start_time,
         cleanup=cleanup,
         fetch_traces=fetch_traces,
+        trace_debug={"backend": "arize phoenix"},
     )
 
 

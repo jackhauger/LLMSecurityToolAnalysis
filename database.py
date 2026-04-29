@@ -1,25 +1,30 @@
-"""
-database.py — ChromaDB vector store setup and MITRE ATT&CK ingestion.
-
-Provides:
-- get_or_create_collection() for lazy collection access
-- inject_poisoned_document() / remove_poisoned_document() for attack simulation
-- query_knowledge_base() for RAG retrieval (returns plain dicts)
-- ingest_mitre_attack() for MITRE ATT&CK ingestion
-"""
-
 import time
+import requests
+import httpx
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import chromadb
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
+from mitreattack.stix20 import MitreAttackData
 from config import cfg
 
 _embed_doc: Optional[GoogleGenerativeAIEmbeddings] = None
 _embed_query: Optional[GoogleGenerativeAIEmbeddings] = None
+
+
+def _with_embedding_retry(fn, *args, **kwargs):
+    last_error = None
+    for attempt in range(3):
+        try:
+            return fn(*args, **kwargs)
+        except (httpx.HTTPError, requests.RequestException, ConnectionError) as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            time.sleep(1.5 * (attempt + 1))
+    raise last_error
 
 
 def _get_embed_doc() -> GoogleGenerativeAIEmbeddings:
@@ -48,7 +53,6 @@ def get_or_create_collection(
     db_path: str = cfg.chroma_db_path,
     name: str = cfg.chroma_collection_name,
 ):
-    """Lazily create a ChromaDB PersistentClient and return the collection."""
     client = chromadb.PersistentClient(path=db_path)
     return client.get_or_create_collection(
         name=name,
@@ -58,7 +62,7 @@ def get_or_create_collection(
 
 def inject_poisoned_document(collection, doc_id: str, payload_text: str, metadata: dict) -> None:
     """Insert a poisoned document into the given collection."""
-    embedding = _get_embed_doc().embed_documents([payload_text])[0]
+    embedding = _with_embedding_retry(_get_embed_doc().embed_documents, [payload_text])[0]
     collection.upsert(
         ids=[doc_id],
         embeddings=[embedding],
@@ -68,18 +72,11 @@ def inject_poisoned_document(collection, doc_id: str, payload_text: str, metadat
 
 
 def remove_poisoned_document(collection, doc_id: str) -> None:
-    """Remove a document from the collection by ID."""
     collection.delete(ids=[doc_id])
 
 
 def query_knowledge_base(collection, query: str, n_results: int = 3) -> list[dict]:
-    """
-    Retrieve top-n most relevant documents for a query.
-
-    Returns list of dicts: [{page_content, metadata, relevance_score}, ...]
-    Uses RETRIEVAL_QUERY task type for the query embedding.
-    """
-    query_embedding = _get_embed_query().embed_query(query)
+    query_embedding = _with_embedding_retry(_get_embed_query().embed_query, query)
 
     count = collection.count()
     if count == 0:
@@ -114,12 +111,10 @@ _STIX_CACHE = Path("enterprise-attack.json")
 
 
 def _download_stix() -> Path:
-    """Download enterprise-attack.json if not already cached."""
     if _STIX_CACHE.exists():
         print(f"  Using cached STIX file: {_STIX_CACHE}")
         return _STIX_CACHE
 
-    import requests
     print(f"  Downloading MITRE ATT&CK STIX data from {_STIX_URL} ...")
     response = requests.get(_STIX_URL, timeout=120)
     response.raise_for_status()
@@ -129,13 +124,6 @@ def _download_stix() -> Path:
 
 
 def _extract_chunks(stix_path: Path) -> tuple[list[str], list[dict], list[str]]:
-    """
-    Parse MITRE ATT&CK STIX bundle and extract text chunks with metadata.
-
-    Returns (texts, metadatas, ids).
-    """
-    from mitreattack.stix20 import MitreAttackData
-
     attack_data = MitreAttackData(str(stix_path))
     techniques = attack_data.get_techniques(remove_revoked_deprecated=True)
 
@@ -215,16 +203,6 @@ def _extract_chunks(stix_path: Path) -> tuple[list[str], list[dict], list[str]]:
 
 
 def ingest_mitre_attack(collection, force: bool = False) -> int:
-    """
-    Download and ingest MITRE ATT&CK into ChromaDB.
-
-    Args:
-        collection: ChromaDB collection to ingest into.
-        force: Re-ingest even if collection is already populated.
-
-    Returns:
-        Number of chunks upserted.
-    """
     existing = collection.count()
     if existing > 0 and not force:
         print(f"  Collection already has {existing} documents. Use --force to re-ingest.")
@@ -240,7 +218,7 @@ def ingest_mitre_attack(collection, force: bool = False) -> int:
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i : i + EMBED_BATCH]
         print(f"  Embedding batch {i // EMBED_BATCH + 1}/{(len(texts) - 1) // EMBED_BATCH + 1} ...")
-        embeddings = _get_embed_doc().embed_documents(batch)
+        embeddings = _with_embedding_retry(_get_embed_doc().embed_documents, batch)
         all_embeddings.extend(embeddings)
         if i + EMBED_BATCH < len(texts):
             time.sleep(0.5)

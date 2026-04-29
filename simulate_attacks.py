@@ -1,80 +1,62 @@
-"""
-simulate_attacks.py — Trace fetchers.
-"""
-
 import json
-import math
 import time
+import pandas as pd
 from datetime import datetime, timezone
 from typing import List
 from urllib.parse import urlparse
-
+from phoenix.session.client import Client as PhoenixClient
+from langsmith import Client
+from langsmith.utils import LangSmithNotFoundError
 from config import cfg
 
 
-def _fetch_langsmith_trace(run_id: str) -> dict:
-    from langsmith import Client
-    from langsmith.utils import LangSmithNotFoundError
+def _jsonable(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    for method_name in ("model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _jsonable(method())
+            except TypeError:
+                pass
+    if hasattr(value, "__dict__"):
+        return _jsonable(vars(value))
+    return str(value)
 
+
+def _fetch_langsmith_trace(run_id: str) -> dict:
     client = Client()
-    deadline = time.time() + 20
+    deadline = time.time() + 120
     while time.time() < deadline:
         try:
             run = client.read_run(run_id, load_child_runs=True)
         except LangSmithNotFoundError:
             time.sleep(2)
             continue
-        return {
-            "inputs": run.inputs,
-            "outputs": run.outputs,
-            "status": run.status,
-            "start_time": str(run.start_time),
-            "end_time": str(run.end_time),
-            "total_tokens": getattr(run, "total_tokens", None),
-            "prompt_tokens": getattr(run, "prompt_tokens", None),
-            "completion_tokens": getattr(run, "completion_tokens", None),
-            "child_runs": [
-                {
-                    "name": child.name,
-                    "inputs": child.inputs,
-                    "outputs": child.outputs,
-                    "total_tokens": getattr(child, "total_tokens", None),
-                    "prompt_tokens": getattr(child, "prompt_tokens", None),
-                    "completion_tokens": getattr(child, "completion_tokens", None),
-                    "child_runs": [
-                        {
-                            "name": grandchild.name,
-                            "inputs": grandchild.inputs,
-                            "outputs": grandchild.outputs,
-                            "total_tokens": getattr(grandchild, "total_tokens", None),
-                            "prompt_tokens": getattr(grandchild, "prompt_tokens", None),
-                            "completion_tokens": getattr(grandchild, "completion_tokens", None),
-                        }
-                        for grandchild in (child.child_runs or [])
-                    ],
-                }
-                for child in (run.child_runs or [])
-            ],
-        }
+        return _jsonable(run)
         time.sleep(2)
     raise TimeoutError(f"LangSmith run {run_id} was not readable within 20s")
 
 
 def _fetch_phoenix_spans(start_time: datetime, session_id: str | None = None) -> List[dict]:
-    from phoenix.session.client import Client as PhoenixClient
-
     client = PhoenixClient(endpoint=_phoenix_client_endpoint(), warn_if_server_not_running=False)
-    deadline = time.time() + 20
+    deadline = time.time() + 120
+    last_seen_count = 0
     while time.time() < deadline:
         frame = client.query_spans(
             start_time=start_time,
             project_name=cfg.phoenix_project_name,
-            limit=500,
+            limit=5000,
             timeout=10,
         )
         if isinstance(frame, list):
-            import pandas as pd
-
             frame = pd.concat([item for item in frame if not getattr(item, "empty", False)], ignore_index=True)
         if frame is None or getattr(frame, "empty", False):
             time.sleep(2)
@@ -91,54 +73,19 @@ def _fetch_phoenix_spans(start_time: datetime, session_id: str | None = None) ->
             time.sleep(2)
             continue
 
-        spans = frame.to_dict(orient="records")
+        spans = _jsonable(frame.to_dict(orient="records"))
         if spans:
-            trimmed = []
-            for span in spans[:200]:
-                trimmed.append(
-                    {
-                        key: value
-                        for key, value in span.items()
-                        if not isinstance(value, str) or len(value) <= 4000
-                    }
-                    | {
-                        key: value[:4000] + f"... [truncated {len(value) - 4000} chars]"
-                        for key, value in span.items()
-                        if isinstance(value, str) and len(value) > 4000
-                    }
-                )
-            has_answer_evidence = False
-            for span in trimmed:
-                name = str(span.get("name", "")).lower()
-                kind = str(
-                    span.get("attributes.openinference.span.kind")
-                    or span.get("span_kind")
-                    or ""
-                ).upper()
-                output_value = (
-                    span.get("attributes.output.value")
-                    or span.get("output")
-                    or span.get("attributes.llm.output_messages")
-                )
-                if (
-                    kind == "LLM"
-                    or name == "answer"
-                    or name == "chatgooglegenerativeai"
-                    or span.get("attributes.llm.token_count.total") is not None
-                    or span.get("attributes.llm.token_count.prompt") is not None
-                    or span.get("attributes.llm.token_count.completion") is not None
-                    or output_value
-                ):
-                    has_answer_evidence = True
-                    break
-            if has_answer_evidence:
-                return trimmed
+            last_seen_count = len(spans)
+            return spans
         time.sleep(2)
-    raise TimeoutError(f"Phoenix spans were not readable within 20s for session {session_id}")
+    raise TimeoutError(
+        f"Phoenix spans were not readable within 120s for session {session_id}. "
+        f"Last seen matching span count: {last_seen_count}"
+    )
 
 
 def _fetch_langfuse_trace(client, trace_id: str, session_id: str, start_time: datetime) -> dict:
-    deadline = time.time() + 20
+    deadline = time.time() + 120
     while time.time() < deadline:
         try:
             if trace_id:

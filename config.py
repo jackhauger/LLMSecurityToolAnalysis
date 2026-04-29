@@ -21,7 +21,12 @@ class Config:
 
     langfuse_secret_key: str = field(default_factory=lambda: os.getenv("LANGFUSE_SECRET_KEY", ""))
     langfuse_public_key: str = field(default_factory=lambda: os.getenv("LANGFUSE_PUBLIC_KEY", ""))
-    langfuse_host: str = field(default_factory=lambda: os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com"))
+    langfuse_host: str = field(
+        default_factory=lambda: os.getenv(
+            "LANGFUSE_HOST",
+            os.getenv("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com"),
+        )
+    )
 
     phoenix_collector_endpoint: str = field(
         default_factory=lambda: os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006/v1/traces")
