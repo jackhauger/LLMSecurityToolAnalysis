@@ -18,6 +18,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from compress import serialize as compress_serialize
+from compress_targeted import compress_targeted
 from config import cfg
 from judge import DetectionJudge, RootCauseJudge
 from rich import box
@@ -32,9 +33,11 @@ def _load_json(path: Path):
     return json.loads(path.read_text())
 
 
-def _judge_trace_text(traces, trace_format: str) -> str:
+def _judge_trace_text(traces, trace_format: str, backend_name: str = "") -> str:
     if trace_format == "compressed":
         return compress_serialize(traces)
+    if trace_format == "targeted":
+        return compress_targeted(traces, backend_name)
     return json.dumps(traces, indent=2, default=str)
 
 
@@ -67,13 +70,17 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
 
         for backend_name, bdata in result.get("backends", {}).items():
             trace_file = bdata.get("trace_file")
-            if not trace_file:
+            inline_traces = bdata.get("traces")
+            if not trace_file and inline_traces is None:
                 continue
 
             console.print(f"  [{backend_name}] {tc_id} loading saved trace...", end="")
-            traces = _load_json(Path(trace_file))
+            if trace_file:
+                traces = _load_json(Path(trace_file))
+            else:
+                traces = inline_traces
             console.print(" compressing...", end="")
-            trace_text = _judge_trace_text(traces, trace_format)
+            trace_text = _judge_trace_text(traces, trace_format, backend_name)
             detection = None
             root_cause = None
             judge_prompt = ""
@@ -320,7 +327,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Re-judge saved traces")
     parser.add_argument("--results-dir", default="results", help="Directory containing saved benchmark result JSON files")
     parser.add_argument("--output-dir", default="reanalyzed_results", help="Directory where reanalysis outputs should be written")
-    parser.add_argument("--trace-format", choices=["raw", "compressed"], default="compressed", help="Format of trace text given to the judges")
+    parser.add_argument("--trace-format", choices=["raw", "compressed", "targeted"], default="compressed", help="Format of trace text given to the judges")
     parser.add_argument("--no-judge", action="store_true", help="Only write transformed trace text, skip judge calls")
     args = parser.parse_args()
 

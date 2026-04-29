@@ -384,3 +384,215 @@ def _detection_by_attack_type(results_dir: Path, backend: str) -> dict:
 
 def _format_attack_type_label(attack_type: str) -> str:
     return str(attack_type).replace("_", " ").title()
+
+
+# ── Compression comparison charts ────────────────────────────────────────────
+
+def write_compression_comparison_charts(
+    generic_summary: dict,
+    targeted_summary: dict,
+    generic_dir: Path,
+    targeted_dir: Path,
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    backends = list(
+        dict.fromkeys(
+            list(generic_summary.get("backends", {}).keys())
+            + list(targeted_summary.get("backends", {}).keys())
+        )
+    )
+    _write_size_comparison_chart(generic_dir, targeted_dir, backends, out_dir / "size_comparison.png")
+    _write_detection_comparison_chart(generic_summary, targeted_summary, backends, out_dir / "detection_comparison.png")
+    _write_rca_comparison_chart(generic_summary, targeted_summary, backends, out_dir / "rca_comparison.png")
+
+
+def _collect_trace_sizes(directory: Path, fmt: str) -> dict[str, list[int]]:
+    sizes: dict[str, list[int]] = {}
+    for tc_dir in sorted(directory.glob("TC-*")):
+        if not tc_dir.is_dir():
+            continue
+        for backend_dir in tc_dir.iterdir():
+            if not backend_dir.is_dir():
+                continue
+            trace_file = backend_dir / f"judge_trace_{fmt}.txt"
+            if trace_file.exists():
+                backend = backend_dir.name
+                sizes.setdefault(backend, []).append(len(trace_file.read_bytes()))
+    return sizes
+
+
+def _write_size_comparison_chart(
+    generic_dir: Path, targeted_dir: Path, backends: list[str], output_path: Path
+) -> None:
+    fig, ax = plt.subplots(figsize=(8.0, 3.8), dpi=100)
+
+    generic_sizes = _collect_trace_sizes(generic_dir, "compressed")
+    targeted_sizes = _collect_trace_sizes(targeted_dir, "targeted")
+
+    if not backends:
+        ax.axis("off")
+        ax.text(0.02, 0.9, "Mean Trace Bytes: Generic vs Targeted Compression", fontsize=16, transform=ax.transAxes)
+        ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    x = np.arange(len(backends))
+    width = 0.32
+
+    generic_means = [
+        (sum(generic_sizes[b]) / len(generic_sizes[b])) if generic_sizes.get(b) else 0
+        for b in backends
+    ]
+    targeted_means = [
+        (sum(targeted_sizes[b]) / len(targeted_sizes[b])) if targeted_sizes.get(b) else 0
+        for b in backends
+    ]
+
+    for i, backend in enumerate(backends):
+        color = BACKEND_COLORS.get(backend, "#374151")
+        ax.bar(x[i] - width / 2, generic_means[i], width=width * 0.9, color=color, label=f"{backend}" if i == 0 else "_nolegend_")
+        ax.bar(x[i] + width / 2, targeted_means[i], width=width * 0.9, color=color, hatch="//", alpha=0.75, label="_nolegend_")
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#9ca3af", label="generic"),
+        Patch(facecolor="#9ca3af", hatch="//", alpha=0.75, label="targeted"),
+    ] + [
+        Patch(facecolor=BACKEND_COLORS.get(b, "#374151"), label=b)
+        for b in backends
+    ]
+    ax.legend(handles=legend_elements, frameon=False, loc="upper right", fontsize=9)
+
+    ax.set_title("Mean Trace Bytes: Generic vs Targeted Compression", fontsize=16, pad=14)
+    ax.set_xticks(x, backends)
+    ax.set_ylabel("bytes (mean per trace)")
+    ax.grid(axis="y", color="#e5e7eb")
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_detection_comparison_chart(
+    generic_summary: dict, targeted_summary: dict, backends: list[str], output_path: Path
+) -> None:
+    fig, ax = plt.subplots(figsize=(9.0, 4.0), dpi=100)
+
+    if not backends:
+        ax.axis("off")
+        ax.text(0.02, 0.9, "Detection Rates: Generic vs Targeted Compression", fontsize=16, transform=ax.transAxes)
+        ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    metrics_keys = ["detection_rate_true_positive_rate", "false_positive_rate"]
+    labels = ["TPR", "FPR"]
+    n_metrics = len(metrics_keys)
+    n_backends = len(backends)
+    group_width = 0.7
+    bar_width = group_width / (n_backends * 2)
+
+    x = np.arange(n_metrics)
+
+    for i, backend in enumerate(backends):
+        color = BACKEND_COLORS.get(backend, "#374151")
+        g_det = generic_summary.get("backends", {}).get(backend, {}).get("detection", {})
+        t_det = targeted_summary.get("backends", {}).get(backend, {}).get("detection", {})
+
+        for j, mkey in enumerate(metrics_keys):
+            g_val = max(0.0, min(1.0, g_det.get(mkey) or 0.0))
+            t_val = max(0.0, min(1.0, t_det.get(mkey) or 0.0))
+            base_offset = (i - (n_backends - 1) / 2) * (bar_width * 2.2)
+            ax.bar(x[j] + base_offset - bar_width * 0.55, g_val, width=bar_width, color=color,
+                   label=backend if j == 0 else "_nolegend_")
+            ax.bar(x[j] + base_offset + bar_width * 0.55, t_val, width=bar_width, color=color, hatch="//", alpha=0.75,
+                   label="_nolegend_")
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#9ca3af", label="generic"),
+        Patch(facecolor="#9ca3af", hatch="//", alpha=0.75, label="targeted"),
+    ] + [
+        Patch(facecolor=BACKEND_COLORS.get(b, "#374151"), label=b)
+        for b in backends
+    ]
+    ax.legend(handles=legend_elements, frameon=False, loc="upper right", fontsize=9)
+
+    ax.set_title("Detection Rates: Generic vs Targeted Compression", fontsize=16, pad=14)
+    ax.set_xticks(x, labels)
+    ax.set_ylim(0, 1.0)
+    ax.set_yticks(np.linspace(0, 1, 6))
+    ax.grid(axis="y", color="#e5e7eb")
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_rca_comparison_chart(
+    generic_summary: dict, targeted_summary: dict, backends: list[str], output_path: Path
+) -> None:
+    fig, ax = plt.subplots(figsize=(9.0, 4.0), dpi=100)
+
+    if not backends:
+        ax.axis("off")
+        ax.text(0.02, 0.9, "RCA Capabilities: Generic vs Targeted Compression", fontsize=16, transform=ax.transAxes)
+        ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    metrics_keys = ["specific_culprit_identification_rate", "failure_mode_distinction_rate"]
+    labels = ["Culprit ID Rate", "Failure Mode Rate"]
+    n_metrics = len(metrics_keys)
+    n_backends = len(backends)
+    group_width = 0.7
+    bar_width = group_width / (n_backends * 2)
+
+    x = np.arange(n_metrics)
+
+    for i, backend in enumerate(backends):
+        color = BACKEND_COLORS.get(backend, "#374151")
+        g_rca = generic_summary.get("backends", {}).get(backend, {}).get("root_cause_analysis", {})
+        t_rca = targeted_summary.get("backends", {}).get(backend, {}).get("root_cause_analysis", {})
+
+        for j, mkey in enumerate(metrics_keys):
+            g_val = max(0.0, min(1.0, g_rca.get(mkey) or 0.0))
+            t_val = max(0.0, min(1.0, t_rca.get(mkey) or 0.0))
+            base_offset = (i - (n_backends - 1) / 2) * (bar_width * 2.2)
+            ax.bar(x[j] + base_offset - bar_width * 0.55, g_val, width=bar_width, color=color,
+                   label=backend if j == 0 else "_nolegend_")
+            ax.bar(x[j] + base_offset + bar_width * 0.55, t_val, width=bar_width, color=color, hatch="//", alpha=0.75,
+                   label="_nolegend_")
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#9ca3af", label="generic"),
+        Patch(facecolor="#9ca3af", hatch="//", alpha=0.75, label="targeted"),
+    ] + [
+        Patch(facecolor=BACKEND_COLORS.get(b, "#374151"), label=b)
+        for b in backends
+    ]
+    ax.legend(handles=legend_elements, frameon=False, loc="upper right", fontsize=9)
+
+    ax.set_title("RCA Capabilities: Generic vs Targeted Compression", fontsize=16, pad=14)
+    ax.set_xticks(x, labels)
+    ax.set_ylim(0, 1.0)
+    ax.set_yticks(np.linspace(0, 1, 6))
+    ax.grid(axis="y", color="#e5e7eb")
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
