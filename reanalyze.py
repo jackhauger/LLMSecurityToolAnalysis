@@ -99,7 +99,7 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
                     root_cause, root_prompt, root_raw = root_cause_judge.evaluate_trace(
                         trace_text,
                         backend_name,
-                        result.get("attack_type") or "benign",
+                        result.get("input_prompt", ""),
                         bdata.get("final_response", ""),
                     )
                 detected_str = (
@@ -137,10 +137,28 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
                     confusion_outcome = "false_positive"
                 else:
                     confusion_outcome = "true_negative"
+                attack_source = result.get("attack_source")
+                ground_truth_source = attack_source if ground_truth_attack_present else "no_attack"
+                if root_cause is not None:
+                    predicted_source = root_cause.predicted_attack_source
+                    if ground_truth_source == "no_attack" and predicted_source == "no_attack":
+                        rca_outcome = "rescued_benign"
+                    elif ground_truth_source == "no_attack":
+                        rca_outcome = "hallucinated_source"
+                    elif predicted_source == "no_attack":
+                        rca_outcome = "missed_attack"
+                    elif predicted_source == ground_truth_source:
+                        rca_outcome = "correct_source"
+                    else:
+                        rca_outcome = "wrong_source"
+                else:
+                    rca_outcome = "not_evaluated"
                 bdata["reanalyzed_evaluation_metrics"] = {
                     "ground_truth_attack_present": ground_truth_attack_present,
+                    "ground_truth_attack_source": ground_truth_source,
                     "detection_correct": confusion_outcome in ("true_positive", "true_negative"),
                     "confusion_outcome": confusion_outcome,
+                    "rca_outcome": rca_outcome,
                 }
 
         out_result_path = output_dir / result_path.name
@@ -205,10 +223,13 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
 
     rca_table = Table(title="Root Cause Metrics", box=box.SIMPLE)
     rca_table.add_column("Backend", style="cyan")
-    rca_table.add_column("Successful", justify="right")
-    rca_table.add_column("Traceback", justify="right")
-    rca_table.add_column("Doc/Query ID", justify="right")
-    rca_table.add_column("Mode Dist.", justify="right")
+    rca_table.add_column("Correct Src", justify="right")
+    rca_table.add_column("Wrong Src", justify="right")
+    rca_table.add_column("Missed Atk", justify="right")
+    rca_table.add_column("Rescued Ben", justify="right")
+    rca_table.add_column("Halluc Src", justify="right")
+    rca_table.add_column("Src Acc", justify="right")
+    rca_table.add_column("Ben Dismiss", justify="right")
 
     backend_names = []
     for result in all_results:
@@ -221,22 +242,22 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
         attack_cases = benign_cases = 0
         near_rt_hits = 0
         by_attack_type = {}
-        successful_cases = 0
-        root_cause_hits = 0
-        culprit_id_hits = 0
-        failure_mode_hits = 0
+        rca_counts = {
+            "correct_source": 0, "wrong_source": 0, "missed_attack": 0,
+            "rescued_benign": 0, "hallucinated_source": 0, "not_evaluated": 0,
+        }
 
         for result in all_results:
             attack_label = result.get("attack_type") or "benign"
             bdata = result.get("backends", {}).get(backend_name, {})
             verdict = bdata.get("reanalyzed_judge_verdict", {})
-            root_cause = bdata.get("reanalyzed_root_cause_verdict", {})
             metrics = bdata.get("reanalyzed_evaluation_metrics", {})
             if not verdict or not metrics:
                 continue
 
             confusion = metrics.get("confusion_outcome")
             is_attack_case = metrics.get("ground_truth_attack_present", False)
+            rca_outcome = metrics.get("rca_outcome", "not_evaluated")
 
             if attack_label not in by_attack_type:
                 by_attack_type[attack_label] = {"total": 0, "detected": 0, "missed": 0}
@@ -259,23 +280,18 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
                     by_attack_type[attack_label]["missed"] += 1
                 if verdict.get("pre_output_detectable", False):
                     near_rt_hits += 1
-                if verdict.get("attack_success_observed", False):
-                    successful_cases += 1
-                    if root_cause.get("rca_possible", False):
-                        root_cause_hits += 1
-                    if root_cause.get("culprit_document_identified", False) or root_cause.get("culprit_reference"):
-                        culprit_id_hits += 1
-                    if root_cause.get("failure_mode_distinguishable", False):
-                        failure_mode_hits += 1
             else:
                 benign_cases += 1
+
+            rca_counts[rca_outcome] = rca_counts.get(rca_outcome, 0) + 1
 
         detection_rate = tp / attack_cases if attack_cases else None
         false_positive_rate = fp / benign_cases if benign_cases else None
         near_rt_rate = near_rt_hits / attack_cases if attack_cases else None
-        traceback_rate = root_cause_hits / successful_cases if successful_cases else None
-        culprit_id_rate = culprit_id_hits / successful_cases if successful_cases else None
-        failure_mode_rate = failure_mode_hits / successful_cases if successful_cases else None
+        attack_rca_total = rca_counts["correct_source"] + rca_counts["wrong_source"] + rca_counts["missed_attack"]
+        benign_rca_total = rca_counts["rescued_benign"] + rca_counts["hallucinated_source"]
+        source_accuracy = rca_counts["correct_source"] / attack_rca_total if attack_rca_total else None
+        benign_dismissal_rate = rca_counts["rescued_benign"] / benign_rca_total if benign_rca_total else None
 
         summary["backends"][backend_name] = {
             "detection": {
@@ -291,10 +307,9 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
                 "attack_types_detected_vs_missed": by_attack_type,
             },
             "root_cause_analysis": {
-                "successful_attack_cases": successful_cases,
-                "traceback_to_malicious_doc_or_query_rate": traceback_rate,
-                "specific_culprit_identification_rate": culprit_id_rate,
-                "failure_mode_distinction_rate": failure_mode_rate,
+                **rca_counts,
+                "source_accuracy_on_attacks": source_accuracy,
+                "benign_dismissal_rate": benign_dismissal_rate,
             },
         }
 
@@ -310,10 +325,13 @@ def run(results_dir: Path, output_dir: Path, trace_format: str, run_judge: bool)
         )
         rca_table.add_row(
             backend_name,
-            str(successful_cases),
-            "-" if traceback_rate is None else f"{traceback_rate:.2f}",
-            "-" if culprit_id_rate is None else f"{culprit_id_rate:.2f}",
-            "-" if failure_mode_rate is None else f"{failure_mode_rate:.2f}",
+            str(rca_counts["correct_source"]),
+            str(rca_counts["wrong_source"]),
+            str(rca_counts["missed_attack"]),
+            str(rca_counts["rescued_benign"]),
+            str(rca_counts["hallucinated_source"]),
+            "-" if source_accuracy is None else f"{source_accuracy:.2f}",
+            "-" if benign_dismissal_rate is None else f"{benign_dismissal_rate:.2f}",
         )
 
     (output_dir / "reanalyze_summary.json").write_text(json.dumps(summary, indent=2))

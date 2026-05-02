@@ -38,10 +38,25 @@ def write_charts(summary: dict, results_dir: Path) -> None:
         backends=backends,
         output_path=charts_dir / "attack_detection_by_difficulty.png",
     )
-    _write_rca_chart(
+    _write_rca_outcome_stacked(
         rca_summary=rca_summary,
         backends=backends,
-        output_path=charts_dir / "rca_capabilities.png",
+        output_path=charts_dir / "rca_outcome_stacked.png",
+    )
+    _write_rca_confusion_matrix(
+        results_dir=results_dir,
+        backends=backends,
+        output_path=charts_dir / "rca_confusion_matrix.png",
+    )
+    _write_rca_source_accuracy_by_attack_type(
+        results_dir=results_dir,
+        backends=backends,
+        output_path=charts_dir / "rca_source_accuracy_by_attack_type.png",
+    )
+    _write_rca_error_scatter(
+        rca_summary=rca_summary,
+        backends=backends,
+        output_path=charts_dir / "rca_error_scatter.png",
     )
 
 
@@ -214,42 +229,216 @@ def _write_detection_by_attack_type_chart(detection_summary: dict, backends: lis
     plt.close(fig)
 
 
-def _write_rca_chart(rca_summary: dict, backends: list[str], output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(7.6, 3.4), dpi=100)
+def _write_rca_outcome_stacked(rca_summary: dict, backends: list[str], output_path: Path) -> None:
+    OUTCOME_COLORS = {
+        "correct_source": "#16a34a",
+        "wrong_source": "#f59e0b",
+        "missed_attack": "#dc2626",
+        "rescued_benign": "#2563eb",
+        "hallucinated_source": "#7c3aed",
+        "not_evaluated": "#9ca3af",
+    }
+    outcome_keys = list(OUTCOME_COLORS.keys())
+    outcome_labels = ["Correct Src", "Wrong Src", "Missed Attack", "Rescued Benign", "Halluc. Src", "Not Evaluated"]
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.0), dpi=100)
 
     if not backends:
         ax.axis("off")
-        ax.text(0.02, 0.9, "Root Cause Analysis Capabilities", fontsize=18, transform=ax.transAxes)
+        ax.text(0.02, 0.9, "RCA Outcome Distribution per Backend", fontsize=16, transform=ax.transAxes)
         ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
         fig.savefig(output_path, bbox_inches="tight")
         plt.close(fig)
         return
 
-    categories = ["Specific Culprit Identified", "Failure Mode Distinguishable"]
-    x = np.arange(len(categories))
-    width = 0.18 if len(backends) >= 3 else 0.24
+    x = np.arange(len(backends))
+    bottoms = np.zeros(len(backends))
+
+    for key, label in zip(outcome_keys, outcome_labels):
+        values = [rca_summary.get(b, {}).get(key, 0) for b in backends]
+        ax.bar(x, values, bottom=bottoms, color=OUTCOME_COLORS[key], label=label, width=0.5)
+        bottoms += np.array(values, dtype=float)
+
+    ax.set_title("RCA Outcome Distribution per Backend", fontsize=16, pad=14)
+    ax.set_xticks(x, backends)
+    ax.set_ylabel("cases")
+    ax.grid(axis="y", color="#e5e7eb")
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="upper right", fontsize=9, ncol=2)
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_rca_confusion_matrix(results_dir: Path, backends: list[str], output_path: Path) -> None:
+    GT_LABELS = ["poisoned_document", "malicious_prompt", "other", "no_attack"]
+    PRED_LABELS = ["poisoned_document", "malicious_prompt", "other", "no_attack", "not_evaluated"]
+
+    n_backends = len(backends)
+    if n_backends == 0:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        ax.axis("off")
+        ax.text(0.02, 0.9, "RCA Confusion Matrix", fontsize=16, transform=ax.transAxes)
+        ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    fig, axes = plt.subplots(1, n_backends, figsize=(5.5 * n_backends, 5.0), dpi=100)
+    if n_backends == 1:
+        axes = [axes]
+
+    for ax, backend in zip(axes, backends):
+        matrix = np.zeros((len(GT_LABELS), len(PRED_LABELS)), dtype=int)
+        for result_path in sorted(results_dir.glob("TC-*.json")):
+            result = json.loads(result_path.read_text())
+            bdata = result.get("backends", {}).get(backend, {})
+            metrics = bdata.get("evaluation_metrics", {})
+            gt = metrics.get("ground_truth_attack_source", "no_attack")
+            rca_outcome = metrics.get("rca_outcome", "not_evaluated")
+
+            predicted = "not_evaluated"
+            if rca_outcome == "correct_source":
+                predicted = gt
+            elif rca_outcome == "wrong_source":
+                rcv = bdata.get("root_cause_verdict", {})
+                predicted = rcv.get("predicted_attack_source", "not_evaluated")
+                if predicted not in PRED_LABELS:
+                    predicted = "not_evaluated"
+            elif rca_outcome in ("missed_attack", "rescued_benign"):
+                predicted = "no_attack"
+            elif rca_outcome == "hallucinated_source":
+                rcv = bdata.get("root_cause_verdict", {})
+                predicted = rcv.get("predicted_attack_source", "not_evaluated")
+                if predicted not in PRED_LABELS:
+                    predicted = "not_evaluated"
+
+            if gt not in GT_LABELS:
+                gt = "no_attack"
+
+            row = GT_LABELS.index(gt)
+            col = PRED_LABELS.index(predicted)
+            matrix[row, col] += 1
+
+        im = ax.imshow(matrix, cmap="Blues", aspect="auto")
+        ax.set_xticks(range(len(PRED_LABELS)))
+        ax.set_xticklabels([p.replace("_", "\n") for p in PRED_LABELS], fontsize=8)
+        ax.set_yticks(range(len(GT_LABELS)))
+        ax.set_yticklabels([g.replace("_", "\n") for g in GT_LABELS], fontsize=8)
+        ax.set_xlabel("Predicted", fontsize=10)
+        ax.set_ylabel("Ground Truth", fontsize=10)
+        ax.set_title(backend, fontsize=12)
+        for r in range(len(GT_LABELS)):
+            for c in range(len(PRED_LABELS)):
+                val = matrix[r, c]
+                ax.text(c, r, str(val), ha="center", va="center",
+                        color="white" if val > matrix.max() * 0.6 else "black", fontsize=10)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle("RCA Confusion Matrix (rows=ground truth, cols=predicted)", fontsize=14, y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_rca_source_accuracy_by_attack_type(results_dir: Path, backends: list[str], output_path: Path) -> None:
+    attack_types = []
+    counts: dict[str, dict[str, dict]] = {}
+
+    for result_path in sorted(results_dir.glob("TC-*.json")):
+        result = json.loads(result_path.read_text())
+        if result.get("benign"):
+            continue
+        at = result.get("attack_type") or "unknown"
+        if at not in attack_types:
+            attack_types.append(at)
+        for backend in backends:
+            metrics = result.get("backends", {}).get(backend, {}).get("evaluation_metrics", {})
+            rca_outcome = metrics.get("rca_outcome", "not_evaluated")
+            entry = counts.setdefault(backend, {}).setdefault(at, {"correct": 0, "total": 0})
+            if rca_outcome in ("correct_source", "wrong_source", "missed_attack"):
+                entry["total"] += 1
+                if rca_outcome == "correct_source":
+                    entry["correct"] += 1
+
+    fig, ax = plt.subplots(figsize=(9.6, 4.2), dpi=100)
+
+    if not backends or not attack_types:
+        ax.axis("off")
+        ax.text(0.02, 0.9, "RCA Source Accuracy by Attack Type", fontsize=16, transform=ax.transAxes)
+        ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    x = np.arange(len(attack_types))
+    width = min(0.24, 0.8 / max(len(backends), 1))
     offsets = (np.arange(len(backends)) - (len(backends) - 1) / 2) * width
 
     for i, backend in enumerate(backends):
-        metrics = rca_summary.get(backend, {})
-        values = [
-            metrics.get("specific_culprit_identification_rate") or 0.0,
-            metrics.get("failure_mode_distinction_rate") or 0.0,
-        ]
-        values = [max(0.0, min(1.0, v)) for v in values]
-        ax.bar(
-            x + offsets[i],
-            values,
-            width=width * 0.9,
-            color=BACKEND_COLORS.get(backend, "#374151"),
-            label=backend,
-        )
+        values = []
+        for at in attack_types:
+            entry = counts.get(backend, {}).get(at, {"correct": 0, "total": 0})
+            values.append(entry["correct"] / entry["total"] if entry["total"] else 0.0)
+        ax.bar(x + offsets[i], values, width=width * 0.9,
+               color=BACKEND_COLORS.get(backend, "#374151"), label=backend)
 
-    ax.set_title("Root Cause Analysis Capabilities", fontsize=18, pad=14)
-    ax.set_xticks(x, categories)
+    ax.set_title("RCA Source Accuracy by Attack Type", fontsize=16, pad=14)
+    ax.set_xticks(x, [_format_attack_type_label(at) for at in attack_types], rotation=20, ha="right")
     ax.set_ylim(0, 1.0)
     ax.set_yticks(np.linspace(0, 1, 6))
+    ax.set_ylabel("correct source rate")
     ax.grid(axis="y", color="#e5e7eb")
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_rca_error_scatter(rca_summary: dict, backends: list[str], output_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(6.0, 5.0), dpi=100)
+
+    if not backends:
+        ax.axis("off")
+        ax.text(0.02, 0.9, "RCA Error Modes: Hallucination vs Missed Attacks", fontsize=14, transform=ax.transAxes)
+        ax.text(0.02, 0.72, "No data available", fontsize=12, transform=ax.transAxes)
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    for backend in backends:
+        metrics = rca_summary.get(backend, {})
+        halluc = metrics.get("hallucinated_source", 0)
+        rescued = metrics.get("rescued_benign", 0)
+        missed = metrics.get("missed_attack", 0)
+        correct = metrics.get("correct_source", 0)
+        wrong = metrics.get("wrong_source", 0)
+
+        benign_rca_total = halluc + rescued
+        attack_rca_total = missed + correct + wrong
+        halluc_rate = halluc / benign_rca_total if benign_rca_total else 0.0
+        missed_rate = missed / attack_rca_total if attack_rca_total else 0.0
+
+        color = BACKEND_COLORS.get(backend, "#374151")
+        ax.scatter(halluc_rate, missed_rate, s=180, color=color, zorder=3, label=backend)
+        ax.annotate(backend, (halluc_rate, missed_rate),
+                    textcoords="offset points", xytext=(8, 4), fontsize=9, color=color)
+
+    ax.set_xlabel("Hallucinated source rate\n(benign flagged, RCA picks wrong source)", fontsize=10)
+    ax.set_ylabel("Missed attack rate\n(real attack, RCA says no_attack)", fontsize=10)
+    ax.set_title("RCA Error Modes\n(bottom-left = best)", fontsize=14, pad=10)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.axhline(0.5, color="#e5e7eb", linewidth=1)
+    ax.axvline(0.5, color="#e5e7eb", linewidth=1)
+    ax.grid(color="#f3f4f6")
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -318,33 +507,23 @@ def _summary_rca(summary: dict, results_dir: Path, backends: list[str]) -> dict:
     if "backends" in summary:
         return {backend: data.get("root_cause_analysis", {}) for backend, data in summary.get("backends", {}).items()}
 
+    outcome_keys = ["correct_source", "wrong_source", "missed_attack", "rescued_benign", "hallucinated_source", "not_evaluated"]
     rca = {}
     for backend in backends:
-        successful_cases = 0
-        culprit_id_hits = 0
-        failure_mode_hits = 0
+        counts = {k: 0 for k in outcome_keys}
 
         for result_path in sorted(results_dir.glob("TC-*.json")):
             result = json.loads(result_path.read_text())
-            verdict = _result_verdict(result, backend)
-            root_cause = _result_root_cause(result, backend)
-            if not verdict or not root_cause:
-                continue
+            metrics = result.get("backends", {}).get(backend, {}).get("evaluation_metrics", {})
+            rca_outcome = metrics.get("rca_outcome", "not_evaluated")
+            counts[rca_outcome] = counts.get(rca_outcome, 0) + 1
 
-            if verdict.get("attack_success_observed", False):
-                successful_cases += 1
-                if root_cause.get("culprit_document_identified", False) or root_cause.get("culprit_reference"):
-                    culprit_id_hits += 1
-                if root_cause.get("failure_mode_distinguishable", False):
-                    failure_mode_hits += 1
-
+        attack_rca_total = counts["correct_source"] + counts["wrong_source"] + counts["missed_attack"]
+        benign_rca_total = counts["rescued_benign"] + counts["hallucinated_source"]
         rca[backend] = {
-            "specific_culprit_identification_rate": (
-                culprit_id_hits / successful_cases if successful_cases else None
-            ),
-            "failure_mode_distinction_rate": (
-                failure_mode_hits / successful_cases if successful_cases else None
-            ),
+            **counts,
+            "source_accuracy_on_attacks": counts["correct_source"] / attack_rca_total if attack_rca_total else None,
+            "benign_dismissal_rate": counts["rescued_benign"] / benign_rca_total if benign_rca_total else None,
         }
     return rca
 
@@ -551,8 +730,8 @@ def _write_rca_comparison_chart(
         plt.close(fig)
         return
 
-    metrics_keys = ["specific_culprit_identification_rate", "failure_mode_distinction_rate"]
-    labels = ["Culprit ID Rate", "Failure Mode Rate"]
+    metrics_keys = ["source_accuracy_on_attacks", "benign_dismissal_rate"]
+    labels = ["Source Accuracy", "Benign Dismissal Rate"]
     n_metrics = len(metrics_keys)
     n_backends = len(backends)
     group_width = 0.7
