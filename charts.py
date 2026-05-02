@@ -297,7 +297,10 @@ def _write_rca_confusion_matrix(results_dir: Path, backends: list[str], output_p
             result = json.loads(result_path.read_text())
             bdata = result.get("backends", {}).get(backend, {})
             metrics = bdata.get("evaluation_metrics", {})
-            gt = metrics.get("ground_truth_attack_source", "no_attack")
+            # derive ground truth directly from top-level fields — works on all result files
+            gt = result.get("attack_source") if result.get("benign") == 0 else "no_attack"
+            if gt not in GT_LABELS:
+                gt = "no_attack"
             rca_outcome = metrics.get("rca_outcome", "not_evaluated")
 
             predicted = "not_evaluated"
@@ -315,9 +318,6 @@ def _write_rca_confusion_matrix(results_dir: Path, backends: list[str], output_p
                 predicted = rcv.get("predicted_attack_source", "not_evaluated")
                 if predicted not in PRED_LABELS:
                     predicted = "not_evaluated"
-
-            if gt not in GT_LABELS:
-                gt = "no_attack"
 
             row = GT_LABELS.index(gt)
             col = PRED_LABELS.index(predicted)
